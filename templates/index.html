@@ -85,6 +85,62 @@ body{margin:0; font-family:"Inter",system-ui,sans-serif; color:var(--ink); backg
 .field:focus{outline:none; border-color:var(--crimson); box-shadow:0 0 0 3px var(--crimson-glow)}
 .field::placeholder{color:var(--ink-faint)}
 
+/* ── Clip brief (free-text prompt) ── */
+.brief{width:100%; min-height:82px; resize:vertical; line-height:1.55}
+.brief-head{display:flex; align-items:baseline; gap:9px; margin-bottom:9px; flex-wrap:wrap}
+.brief-lbl{font-size:13px; font-weight:600; color:var(--ink-soft)}
+.brief-opt{font-size:12px; color:var(--ink-faint)}
+.brief-count{margin-left:auto; font-size:11.5px; color:var(--ink-faint); font-variant-numeric:tabular-nums}
+.brief-count.over{color:var(--crimson); font-weight:600}
+.chips{display:flex; flex-wrap:wrap; gap:7px; margin-top:10px}
+.chip{background:var(--field); border:1px solid var(--field-line); color:var(--ink-soft);
+  font-size:12px; padding:6px 11px; border-radius:999px; cursor:pointer; transition:.16s; font-family:inherit}
+.chip:hover{border-color:var(--crimson); color:var(--ink)}
+
+/* ── Setup / API keys ── */
+.setup-btn{display:flex; align-items:center; gap:8px; background:var(--panel); border:1px solid var(--hair);
+  color:var(--ink); padding:9px 14px; border-radius:11px; font-size:13px; font-weight:600;
+  cursor:pointer; font-family:inherit; transition:.18s}
+.setup-btn:hover{border-color:var(--crimson)}
+.setup-btn .sdot{width:8px; height:8px; border-radius:50%; background:var(--ink-faint); flex:none}
+.setup-btn .sdot.ok{background:#3DDC84; box-shadow:0 0 0 3px rgba(61,220,132,.18)}
+.setup-btn .sdot.bad{background:#FF6B6B; box-shadow:0 0 0 3px rgba(255,107,107,.18)}
+.topbar-actions{display:flex; align-items:center; gap:9px}
+
+.modal-back{position:fixed; inset:0; background:rgba(0,0,0,.55); backdrop-filter:blur(4px);
+  z-index:100; display:none; align-items:flex-start; justify-content:center; padding:40px 18px; overflow-y:auto}
+.modal-back.show{display:flex}
+.modal{background:var(--panel); border:1px solid var(--hair); border-radius:20px; padding:26px;
+  width:100%; max-width:560px; box-shadow:var(--shadow)}
+.modal h3{margin:0 0 5px; font-size:18px; letter-spacing:-.2px}
+.modal .msub{font-size:13px; color:var(--ink-faint); margin-bottom:20px; line-height:1.55}
+.keyrow{margin-bottom:17px}
+.keyrow .kh{display:flex; align-items:center; gap:8px; margin-bottom:6px; flex-wrap:wrap}
+.keyrow .kname{font-size:13.5px; font-weight:700}
+.keyrow .ktag{font-size:10.5px; font-weight:700; letter-spacing:.4px; text-transform:uppercase;
+  padding:2px 7px; border-radius:5px; background:var(--field); color:var(--ink-faint); border:1px solid var(--field-line)}
+.keyrow .ktag.req{color:var(--crimson); border-color:var(--crimson)}
+.keyrow .ktag.set{color:#3DDC84; border-color:#3DDC84}
+.keyrow .khelp{font-size:12px; color:var(--ink-faint); margin-bottom:7px; line-height:1.5}
+.keyrow .khelp a{color:var(--crimson); text-decoration:none; font-weight:600; white-space:nowrap}
+.keyrow .khelp a:hover{text-decoration:underline}
+.modal-actions{display:flex; gap:10px; margin-top:22px}
+.modal-actions button{flex:1; padding:13px; border-radius:12px; font-size:14px; font-weight:700;
+  cursor:pointer; font-family:inherit; border:1px solid var(--hair); transition:.18s}
+.btn-save{background:var(--crimson); color:#fff; border-color:var(--crimson)}
+.btn-save:hover{filter:brightness(1.08)}
+.btn-close{background:transparent; color:var(--ink-soft)}
+.btn-close:hover{border-color:var(--ink-faint)}
+.setup-msg{margin-top:13px; font-size:12.5px; padding:10px 13px; border-radius:10px; display:none; line-height:1.5}
+.setup-msg.ok{display:block; background:rgba(61,220,132,.12); color:#2fa968; border:1px solid rgba(61,220,132,.3)}
+.setup-msg.err{display:block; background:rgba(255,107,107,.12); color:#d64545; border:1px solid rgba(255,107,107,.3)}
+.setup-banner{background:rgba(255,107,107,.1); border:1px solid rgba(255,107,107,.32); color:var(--ink);
+  border-radius:14px; padding:14px 17px; margin-bottom:20px; font-size:13.5px; display:none;
+  align-items:center; gap:12px; line-height:1.5}
+.setup-banner.show{display:flex}
+.setup-banner button{margin-left:auto; flex:none; background:var(--crimson); color:#fff; border:none;
+  padding:9px 15px; border-radius:9px; font-size:12.5px; font-weight:700; cursor:pointer; font-family:inherit}
+
 .qual{display:flex; align-items:center; gap:12px; margin-top:14px; flex-wrap:wrap}
 .qual-lbl{font-size:13px; font-weight:600; color:var(--ink-soft); display:flex; align-items:center; gap:7px}
 .qual-seg{display:flex; gap:5px; background:var(--field); border:1px solid var(--field-line); padding:4px; border-radius:11px; flex-wrap:wrap}
@@ -307,9 +363,19 @@ body{margin:0; font-family:"Inter",system-ui,sans-serif; color:var(--ink); backg
         <div class="tg">Hindi clip studio</div>
       </div>
     </div>
-    <button class="theme-btn" id="themeToggle" onclick="toggleTheme()">
-      <span id="themeIcon">☀</span><span id="themeLabel">Light</span>
-    </button>
+    <div class="topbar-actions">
+      <button class="setup-btn" id="setupBtn" onclick="openSetup()" title="API keys &amp; provider status">
+        <span class="sdot" id="setupDot"></span><span id="setupLabel">Setup</span>
+      </button>
+      <button class="theme-btn" id="themeToggle" onclick="toggleTheme()">
+        <span id="themeIcon">☀</span><span id="themeLabel">Light</span>
+      </button>
+    </div>
+  </div>
+
+  <div class="setup-banner" id="setupBanner">
+    <span>⚠</span><span id="setupBannerText">Add your API keys to start making clips.</span>
+    <button onclick="openSetup()">Add keys</button>
   </div>
 
   <div class="hero">
@@ -360,6 +426,23 @@ body{margin:0; font-family:"Inter",system-ui,sans-serif; color:var(--ink); backg
   <!-- ── 2 · WHAT TO FIND ── -->
   <div class="card">
     <div class="card-h"><div class="step-no">弐</div><h2>What should the AI look for?</h2></div>
+
+    <div class="brief-head">
+      <span class="brief-lbl">Describe the clips you want</span>
+      <span class="brief-opt">optional — leave blank to let the AI pick freely</span>
+      <span class="brief-count" id="briefCount">0 / 1200</span>
+    </div>
+    <textarea class="field brief" id="clipPrompt" maxlength="1200" oninput="updateBriefCount()"
+      placeholder="e.g. Only the parts where he talks about failure and bouncing back — skip the intro and any promo talk."></textarea>
+    <div class="chips" id="briefChips">
+      <button type="button" class="chip" onclick="useBrief(this)">Motivational moments about struggle</button>
+      <button type="button" class="chip" onclick="useBrief(this)">Funny or surprising reactions</button>
+      <button type="button" class="chip" onclick="useBrief(this)">Practical tips people can act on</button>
+      <button type="button" class="chip" onclick="useBrief(this)">Bold or controversial opinions</button>
+      <button type="button" class="chip" onclick="useBrief(this)">Emotional storytelling</button>
+    </div>
+    <div class="modeinfo" style="margin-bottom:16px"><span>🛈</span><span>When you write a brief, the AI returns only moments that match it — so you may get fewer clips than requested.</span></div>
+
     <div class="opt-grid">
       <label class="opt on" id="tog-viral" onclick="toggleOpt(this)"><div class="toggle-box"></div><div><div class="ot">Viral moments</div><div class="oss">Hooks that stop the scroll</div></div></label>
       <label class="opt on" id="tog-emotional" onclick="toggleOpt(this)"><div class="toggle-box"></div><div><div class="ot">Emotional beats</div><div class="oss">Story &amp; feeling</div></div></label>
@@ -530,6 +613,19 @@ body{margin:0; font-family:"Inter",system-ui,sans-serif; color:var(--ink); backg
 </div>
 
 <div class="toast-wrap" id="toast-wrap"></div>
+
+<div class="modal-back" id="setupModal" onclick="if(event.target===this)closeSetup()">
+  <div class="modal">
+    <h3>API keys</h3>
+    <div class="msub">Paste your keys below — they're saved to a <code>.env</code> file on this machine and never leave it. Only Groq is required; the rest are automatic fallbacks that kick in when a provider is down or rate-limited.</div>
+    <div id="keyRows"></div>
+    <div class="setup-msg" id="setupMsg"></div>
+    <div class="modal-actions">
+      <button class="btn-close" onclick="closeSetup()">Close</button>
+      <button class="btn-save" id="saveKeysBtn" onclick="saveKeys()">Save keys</button>
+    </div>
+  </div>
+</div>
 
 <script>
 // ── State ──
@@ -735,6 +831,7 @@ function getOptions(){
     trend:document.getElementById('tog-trend').classList.contains('on'),
     num_clips:autoClips?'auto':clipCount,
     clip_mode:clipMode,
+    clip_prompt:(document.getElementById('clipPrompt')||{value:''}).value.trim(),
     min_clip_len:20, max_clip_len:40,
     burn_subtitles:capBurn,
     subtitle_layout:capLayout,
@@ -979,10 +1076,116 @@ function pushToast(msg){
 
 document.getElementById('videoUrl').addEventListener('keydown',e=>{ if(e.key==='Enter') startPipeline('url'); });
 
+// ── Clip brief ──
+function updateBriefCount(){
+  const ta=document.getElementById('clipPrompt'), el=document.getElementById('briefCount');
+  const n=ta.value.length;
+  el.textContent=n+' / 1200';
+  el.classList.toggle('over', n>=1200);
+}
+function useBrief(btn){
+  const ta=document.getElementById('clipPrompt');
+  ta.value = ta.value.trim() ? ta.value.replace(/\s*$/,'') + '. ' + btn.textContent : btn.textContent;
+  ta.focus(); updateBriefCount();
+}
+
+// ── Setup / API keys ──
+let _setupState=null, _setupOpened=false;
+
+async function refreshSetup(){
+  try{
+    const r=await fetch('/api/status');
+    if(!r.ok) return;
+    _setupState=await r.json();
+  }catch(e){ return; }
+
+  const dot=document.getElementById('setupDot');
+  const label=document.getElementById('setupLabel');
+  const banner=document.getElementById('setupBanner');
+  const p=_setupState.providers||{};
+
+  // "Ready" needs a text model, a transcription engine AND ffmpeg — each blocks the
+  // pipeline on its own, so the banner names the one that's actually missing.
+  const missing=[];
+  if(!p.transcribe_ready) missing.push('a transcription key (Groq or Deepgram)');
+  if(!p.chat_ready) missing.push('an AI key (Groq, Gemini or OpenRouter)');
+  if(!p.ffmpeg) missing.push('ffmpeg on this machine');
+
+  if(_setupState.ready){
+    dot.className='sdot ok'; label.textContent='Ready';
+    banner.classList.remove('show');
+  } else {
+    dot.className='sdot bad'; label.textContent='Setup';
+    document.getElementById('setupBannerText').textContent =
+      'Before you can make clips, ShortsAI needs '+missing.join(' and ')+'.';
+    banner.classList.add('show');
+  }
+  renderKeyRows();
+
+  // First run opens straight into the key form: run.py sends new users to /#setup,
+  // and a missing key is the one thing they must fix before anything works.
+  if(location.hash==='#setup' && !_setupOpened){ _setupOpened=true; openSetup(); }
+}
+
+function renderKeyRows(){
+  const box=document.getElementById('keyRows');
+  if(!box||!_setupState) return;
+  box.innerHTML=(_setupState.keys||[]).map(k=>`
+    <div class="keyrow">
+      <div class="kh">
+        <span class="kname">${k.label}</span>
+        ${k.required?'<span class="ktag req">Required</span>':'<span class="ktag">Optional</span>'}
+        ${k.set?'<span class="ktag set">Saved</span>':''}
+      </div>
+      <div class="khelp">${k.help} <a href="${k.url}" target="_blank" rel="noopener">Get a key ↗</a></div>
+      <input class="field" type="password" autocomplete="off" spellcheck="false"
+             data-key="${k.key}" placeholder="${k.set?k.masked:'Paste your key here'}">
+    </div>`).join('');
+}
+
+function openSetup(){
+  document.getElementById('setupMsg').className='setup-msg';
+  renderKeyRows();
+  document.getElementById('setupModal').classList.add('show');
+}
+function closeSetup(){ document.getElementById('setupModal').classList.remove('show'); }
+
+async function saveKeys(){
+  const btn=document.getElementById('saveKeysBtn');
+  const msg=document.getElementById('setupMsg');
+  const keys={};
+  // Untouched fields stay empty and are simply not sent, so saving one key never
+  // wipes the others.
+  document.querySelectorAll('#keyRows input[data-key]').forEach(i=>{
+    if(i.value.trim()) keys[i.dataset.key]=i.value.trim();
+  });
+  if(!Object.keys(keys).length){ msg.className='setup-msg err'; msg.textContent='Nothing to save — paste at least one key.'; return; }
+
+  btn.disabled=true; btn.textContent='Saving…';
+  try{
+    const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({keys})});
+    const data=await r.json();
+    if(!r.ok) throw new Error(data.detail||'Save failed');
+    _setupState=data.status;
+    msg.className='setup-msg ok';
+    msg.textContent='Saved. '+(data.saved||[]).join(', ')+' is active now — no restart needed.';
+    document.querySelectorAll('#keyRows input[data-key]').forEach(i=>i.value='');
+    await refreshSetup();
+  }catch(e){
+    msg.className='setup-msg err'; msg.textContent=e.message||'Could not save keys.';
+  }finally{
+    btn.disabled=false; btn.textContent='Save keys';
+  }
+}
+
+document.addEventListener('keydown',e=>{ if(e.key==='Escape') closeSetup(); });
+
 // ── Init ──
 pickPos(capPos);
 updateFontFields();
 renderPreview();
+updateBriefCount();
+refreshSetup();
 </script>
 </body>
 </html>

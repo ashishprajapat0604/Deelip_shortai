@@ -450,22 +450,35 @@ def ensure_templates():
 # ── .env ───────────────────────────────────────────────────────────────────────
 def ensure_env():
     env = HERE / ".env"
+    example = HERE / ".env.example"
     if not env.exists():
-        env.write_text(
-            "# ShortsAI — fill in your API keys before processing videos\n"
-            "GROQ_API_KEY=\n"
-            "DEEPGRAM_API_KEY=\n"
-        )
-        warn(".env created — add your GROQ_API_KEY before processing videos")
+        if example.exists():
+            shutil.copy2(example, env)
+        else:
+            env.write_text(
+                "# ShortsAI — fill in your API keys before processing videos\n"
+                "GROQ_API_KEY=\n"
+                "DEEPGRAM_API_KEY=\n"
+                "GEMINI_API_KEY=\n"
+                "OPENROUTER_API_KEY=\n"
+            )
+        try:
+            env.chmod(0o600)   # holds secrets once filled in
+        except OSError:
+            pass
+        warn(".env created — add your keys in the browser (Setup button) or edit .env")
         return
-    has_groq = any(
-        ln.startswith("GROQ_API_KEY=") and ln.strip() != "GROQ_API_KEY="
-        for ln in env.read_text().splitlines()
-    )
-    if has_groq:
-        ok(".env — GROQ_API_KEY set")
+
+    def _is_set(name):
+        return any(ln.startswith(name + "=") and ln.split("=", 1)[1].strip()
+                   for ln in env.read_text().splitlines())
+
+    configured = [n for n in ("GROQ_API_KEY", "DEEPGRAM_API_KEY",
+                              "GEMINI_API_KEY", "OPENROUTER_API_KEY") if _is_set(n)]
+    if configured:
+        ok(f".env — {len(configured)} key(s) set: {', '.join(configured)}")
     else:
-        warn(".env found but GROQ_API_KEY is empty — add it before processing videos")
+        warn(".env found but no API keys are set — add them in the browser (Setup button)")
 
 # ── Self-test ─────────────────────────────────────────────────────────────────
 # Each _*_TEST_CODE snippet runs inside the venv so it can import installed packages.
@@ -672,15 +685,15 @@ def readiness_summary():
     fonts_present = sum(1 for n in FONT_URLS if (FONTS_DIR / n).exists())
     if fonts_present == 0:
         issues.append("no fonts in ./fonts/  →  run with --skip-fonts=false or bash fetch_fonts.sh")
-    groq_set = False
     env = HERE / ".env"
-    if env.exists():
-        groq_set = any(
-            ln.startswith("GROQ_API_KEY=") and ln.strip() != "GROQ_API_KEY="
-            for ln in env.read_text().splitlines()
-        )
-    if not groq_set:
-        issues.append("GROQ_API_KEY not set in .env  →  required for transcription")
+    text = env.read_text() if env.exists() else ""
+    def _is_set(name):
+        return any(ln.startswith(name + "=") and ln.split("=", 1)[1].strip()
+                   for ln in text.splitlines())
+
+    if not (_is_set("GROQ_API_KEY") or _is_set("DEEPGRAM_API_KEY")):
+        issues.append("no transcription key set  →  add GROQ_API_KEY "
+                      "(free at console.groq.com) in the browser Setup panel")
 
     if issues:
         print()
@@ -692,14 +705,86 @@ def readiness_summary():
         ok("All systems go — ready to process videos")
 
 # ── Launch ─────────────────────────────────────────────────────────────────────
-def launch(host, port, reload_):
+def _port_is_free(host, port):
+    import socket
+    probe_host = "127.0.0.1" if host == "0.0.0.0" else host
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.6)
+        return s.connect_ex((probe_host, port)) != 0
+
+
+def pick_port(host, port, span=20):
+    """Return the first free port at or after `port`.
+
+    Re-running the launcher while an old server is still up would otherwise die with
+    'address already in use' — the common case being a second terminal.
+    """
+    for candidate in range(port, port + span):
+        if _port_is_free(host, candidate):
+            if candidate != port:
+                warn(f"Port {port} is busy — using {candidate} instead")
+            return candidate
+    warn(f"Ports {port}–{port + span - 1} are all busy; trying {port} anyway")
+    return port
+
+
+def _keys_missing():
+    """True when no transcription key is configured — the one thing that blocks
+    every pipeline run, so the browser should land on the setup panel."""
+    env = HERE / ".env"
+    if not env.exists():
+        return True
+    text = env.read_text()
+    for name in ("GROQ_API_KEY", "DEEPGRAM_API_KEY"):
+        for line in text.splitlines():
+            if line.startswith(name + "=") and line.split("=", 1)[1].strip():
+                return False
+    return True
+
+
+def open_browser_when_up(url, port, host):
+    """Open the browser once the server actually answers, so the user never sees a
+    connection-refused page from opening too early."""
+    import threading
+    import webbrowser
+
+    def _wait():
+        import time
+        probe_host = "127.0.0.1" if host == "0.0.0.0" else host
+        import socket
+        for _ in range(100):          # ~20s
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(0.5)
+                if s.connect_ex((probe_host, port)) == 0:
+                    try:
+                        webbrowser.open(url)
+                    except Exception:
+                        pass
+                    return
+            time.sleep(0.2)
+
+    threading.Thread(target=_wait, daemon=True).start()
+
+
+def launch(host, port, reload_, open_browser=True):
     vpy = str(venv_python())
+    port = pick_port(host, port)
     cmd = [vpy, "-m", "uvicorn", "app:app", "--host", host, "--port", str(port)]
     if reload_:
         cmd.append("--reload")
+
     shown = host if host != "0.0.0.0" else "localhost"
+    url = f"http://{shown}:{port}"
+    # Land first-time users straight on the API-key form.
+    target = url + "/#setup" if _keys_missing() else url
+
     print()
-    ok(f"Starting ShortsAI  →  http://{shown}:{port}")
+    ok(f"Starting ShortsAI  →  {url}")
+    if host == "0.0.0.0":
+        info("Reachable from other devices on your network at this machine's IP.")
+    if open_browser:
+        info("Opening your browser…")
+        open_browser_when_up(target, port, host)
     info("Press Ctrl+C to stop.\n")
     try:
         subprocess.run(cmd)
@@ -733,6 +818,8 @@ def main():
                     help="Run all setup steps but do not start the server")
     ap.add_argument("--skip-test",      action="store_true",
                     help="Skip API key and subtitle engine self-tests")
+    ap.add_argument("--no-browser",     action="store_true",
+                    help="Do not open the web UI in a browser on start")
     args = ap.parse_args()
 
     os.chdir(HERE)
@@ -773,7 +860,7 @@ def main():
         ok("Setup complete.  Start any time:  " + c("python3 run.py", "1"))
         return
 
-    launch(args.host, args.port, args.reload)
+    launch(args.host, args.port, args.reload, open_browser=not args.no_browser)
 
 
 if __name__ == "__main__":

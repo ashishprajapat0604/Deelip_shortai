@@ -1,19 +1,121 @@
-# ShortsAI — Hindi Viral Clip Pipeline
+# ShortsAI — Hindi Viral Clip Studio
 
-Turn a long Hindi video (file or URL) into ready-to-post **9:16 vertical Shorts**.
-The AI finds the strongest moments, cuts them clean at full sentences (20–40s each),
-and burns in captions exactly the way you want them — or leaves them off.
+Turn a long Hindi video (file or link) into ready-to-post **9:16 vertical Shorts**.
+Describe the clips you want in plain English, and the AI finds those moments, cuts
+them clean at full sentences, and burns in captions exactly how you like them.
 
 ---
 
-## Contents
+## Install — one command
 
-- `app.py` — FastAPI server + the web UI route. Orchestrates jobs.
-- `select_clips.py` — download → transcribe → AI-select → cut. Writes `clips_manifest.json`.
-- `burn_subtitles.py` — per-clip transcription + caption rendering (single ffmpeg pass).
-- `index.html` — the web front-end (**must be placed at `templates/index.html`**).
-- `requirements.txt` — Python dependencies.
-- `fonts/` — **you add this** — holds the Devanagari font (see [Fonts](#fonts-important)).
+Everything (Python packages, ffmpeg, 18 caption fonts) is installed for you, and the
+web page opens automatically.
+
+**Linux · macOS · WSL**
+```bash
+curl -fsSL https://raw.githubusercontent.com/ashishprajapat0604/short_aiv2/version2/install.sh | bash
+```
+
+**Windows (PowerShell)**
+```powershell
+irm https://raw.githubusercontent.com/ashishprajapat0604/short_aiv2/version2/install.ps1 | iex
+```
+
+You only need **git** and **Python 3.10+** beforehand; the installer tells you exactly
+how to get them if they're missing.
+
+Then paste your **Groq API key** (free, 30 seconds) into the Setup panel that opens in
+your browser — and you're done. Nothing else to configure, no files to edit.
+
+### Already have the repo?
+
+```bash
+python3 run.py
+```
+
+That single command sets up anything missing and starts the app. Re-run it any time.
+
+| Flag | What it does |
+|---|---|
+| `--port 9000` | Use a different port (busy ports are skipped automatically) |
+| `--host 0.0.0.0` | Reach it from your phone on the same Wi-Fi |
+| `--no-browser` | Don't open a browser |
+| `--reload` | Dev mode: restart on code changes |
+| `--setup-only` | Install everything but don't start |
+| `--reinstall` | Force-refresh the Python packages |
+| `--skip-fonts` | Skip font downloads on re-runs |
+
+---
+
+## API keys
+
+Click **Setup** in the top-right of the page. Keys are written to a local `.env` file
+(owner-only permissions) and take effect immediately — no restart.
+
+| Key | Needed? | What it does |
+|---|---|---|
+| **Groq** | **Yes** (free) | Transcription + AI clip selection |
+| Deepgram | Optional | Best Hindi caption accuracy |
+| Google Gemini | Optional | Fallback when Groq is rate-limited |
+| OpenRouter | Optional | Last-resort text fallback |
+
+Only Groq is required. The others are **fallbacks** — every extra key you add makes the
+pipeline harder to break. You can also copy `.env.example` to `.env` and edit it by hand.
+
+> For safety, the Setup panel only accepts key changes from the machine running
+> ShortsAI, even when you serve it on `0.0.0.0`.
+
+---
+
+## Describe the clips you want
+
+The **"Describe the clips you want"** box is the fastest way to get clips you'll
+actually post. Write it like you'd brief an editor:
+
+> *Only the parts where he talks about failure and bouncing back — skip the intro and any promo talk.*
+
+> *Funny moments and audience reactions. No serious advice.*
+
+> *Anything about pricing, revenue, or how much things cost.*
+
+When a brief is set, the AI returns **only** matching moments and explains the match in
+each clip's reason — so you may get fewer clips than requested. That's deliberate: a
+brief means "these clips or none", not "pad it out". Leave it blank to let the AI pick
+the most viral moments generally.
+
+---
+
+## Built to not break
+
+Every step that can fail has somewhere to fall back to, so one outage never sinks a job.
+
+| Step | Fallback chain |
+|---|---|
+| Text / AI selection | Groq → Gemini → OpenRouter → local Ollama |
+| Transcription | Groq Whisper → Deepgram → local faster-whisper (offline) |
+| Per-clip captions | Deepgram → Groq → local → slice the full transcript |
+| Video download | cookies → no cookies → android client → any format |
+| Audio extraction | 16 kHz → 44.1 kHz → forgiving re-encode |
+| Video encoding | NVENC → AMF → QSV → CPU (always works) |
+| Caption rendering | captions → CPU + captions → **render without captions** |
+| No transcript at all | evenly spaced time-based clips, captions off |
+| Translation fails | falls back to Hindi captions rather than blank ones |
+
+Plus: every external command has a **timeout** and retries, so a hung `ffmpeg` or
+`yt-dlp` can't freeze a job. Jobs are **saved to disk**, so finished clips survive a
+server restart (jobs interrupted mid-run are marked failed instead of spinning forever).
+
+Order is configurable — see `CHAT_ORDER` / `TRANSCRIBE_ORDER` in `.env.example`.
+
+### Fully offline (optional)
+
+Add these and ShortsAI keeps working with **no internet and no API keys**:
+
+```bash
+pip install faster-whisper          # offline transcription
+# install Ollama from https://ollama.com, then:
+ollama pull llama3.1                # offline text/selection
+```
 
 ---
 
@@ -21,243 +123,119 @@ and burns in captions exactly the way you want them — or leaves them off.
 
 | Feature | Options | Default |
 |---|---|---|
-| Clip length | 20–40 seconds (min/max overridable) | 20–40s |
-| Burn subtitles | on / off (off = clean 9:16, no captions) | on |
-| Layout | `single` (one language) · `dual` (Hindi ↑ / English ↓) | single |
-| Language *(single)* | `hindi` · `english` · `hinglish` | hindi |
-| Position *(single)* | `top` · `middle` · `bottom` (on video) · `below` (under video) | bottom |
-| Caption look | `outline` · `box` · `white_box` · `bold_yellow` · `karaoke` · `word_pop` | outline |
-| Accent colour | any `#RRGGBB` (used by `karaoke` / `word_pop`) | yellow |
+| Clip brief | free text — describe what you want | *(blank)* |
+| Clip mode | `multi` (~1/min, 20–40s) · `best` (fewer, 40–60s) | multi |
+| Number of clips | auto (1 per minute) or 5–60 | auto |
+| Burn subtitles | on / off | on |
+| Layout | `single` · `dual` (Hindi ↑ / English ↓) | single |
+| Language | `hindi` · `english` · `hinglish` | hindi |
+| Position | `top` · `middle` · `bottom` · `below` | bottom |
+| Caption look | outline · box · white_box · bold_yellow · karaoke · neon · retro · shadow · fire · fade | outline |
+| Fonts | 8 Devanagari · 10 Latin | Noto / Poppins |
 | AI title line | on / off | off |
 
-`english` = translation of the Hindi audio. `hinglish` = the Hindi romanised into
-Latin letters. `dual` reproduces the classic Hindi-top / English-bottom look.
-
-**Caption styles:**
-- `outline` — clean white text with a black outline (default).
-- `box` — white text on a solid dark translucent slab.
-- `white_box` — dark text on a solid whitish slab.
-- `bold_yellow` — big bold uppercase yellow, heavy outline (classic TikTok look).
-- `karaoke` — the phrase stays on screen and the spoken word lights up in the accent
-  colour and enlarges (Hormozi-style). Uses word timings for Hindi; for English/Hinglish
-  it distributes timing evenly across the words.
-- `word_pop` — one big word on screen at a time, scaling/fading in (fast-cut Reels look).
-
-`karaoke` and `word_pop` honour `caption_accent` (`#RRGGBB`) for the highlighted word.
-
-**Caption positioning** (single layout) is geometry-aware. When the source isn't already
-9:16 it gets letterboxed (black bars top/bottom), and the position decides where the
-caption lands relative to the actual video band:
-- `bottom` — ON the video, near its bottom edge (overlaid on the footage; the classic look).
-- `below` — just BELOW the video band, in the lower letterbox bar (outside the footage).
-- `top` — just ABOVE the video band, in the upper letterbox bar.
-- `middle` — centred over the video.
-
-For an already-vertical source with no bars, `below`/`top` fall back to a normal in-frame
-margin. The web UI exposes this as a visual picker (tap where the caption should sit).
-
----
-
-## Requirements
-
-**System (not pip-installable):**
-- Python 3.10+
-- `ffmpeg` and `ffprobe` on `PATH`
-- A **Devanagari font** for Hindi/dual captions (see below)
-
-**Python:** see `requirements.txt`.
-
-```bash
-pip install -r requirements.txt
-```
-
-Install ffmpeg if needed:
-```bash
-# Debian / Ubuntu
-sudo apt-get update && sudo apt-get install -y ffmpeg
-# macOS
-brew install ffmpeg
-```
-
----
-
-## Fonts (important)
-
-The earlier "subtitles didn't load" problem was a **missing Devanagari font**. Latin
-captions (English/Hinglish) render with Poppins, which most servers already have, but
-**Hindi and dual layouts need a Devanagari-capable font**.
-
-Create a `fonts/` folder next to `burn_subtitles.py` and drop a Devanagari `.ttf` in it:
-
-```
-fonts/
-└── NotoSansDevanagari-Bold.ttf
-```
-
-Get it from Google Fonts (Noto Sans Devanagari). The renderer also auto-detects common
-system locations (`/usr/share/fonts/.../NotoSansDevanagari*`, Lohit, etc.). If **no**
-Devanagari font is found, the logs print a loud `WARNING` and Hindi text may appear as
-empty boxes — English/Hinglish/no-caption modes still work fine.
-
----
-
-## Configuration (`.env`)
-
-Create a `.env` file in the project root:
-
-```ini
-# Required — Groq powers Whisper transcription, translation,
-# transliteration (Hinglish) and AI titles.
-GROQ_API_KEY=your_groq_key
-
-# Optional — per-clip transcription with Deepgram nova-3.
-# If omitted, the pipeline reuses the full-video Whisper transcript instead.
-DEEPGRAM_API_KEY=your_deepgram_key
-
-# Optional tuning (sensible defaults if unset):
-# SUBTITLE_ENGINE=deepgram        # or "whisper" to skip Deepgram
-# MAX_RENDER_WORKERS=2            # parallel ffmpeg renders; auto-scales by RAM if unset
-# GROQ_SELECTION_MODEL=...        # override the highlight-selection model
-# GROQ_SELECTION_MODEL_FALLBACK=...
-# SELECTION_CHUNK_CHARS=...       # transcript chunk size for selection
-```
-
----
-
-## Run
-
-```bash
-# 1. front-end must live at templates/index.html
-mkdir -p templates && cp index.html templates/index.html
-
-# 2. start the server
-uvicorn app:app --host 0.0.0.0 --port 8000
-```
-
-Open `http://localhost:8000`, paste a link or upload a video, choose your caption
-settings, and start. Finished clips appear in the page and download individually or as a zip.
+`english` = translation of the Hindi audio. `hinglish` = the Hindi romanised into Latin
+letters. Everything is previewed live in the page before you render.
 
 ---
 
 ## How it works
 
-1. **Select** (`select_clips.py`) — downloads the source (yt-dlp / gdown), transcribes
-   the full video with Groq Whisper, asks the LLM for the best moments, snaps each to
-   sentence boundaries inside the 20–40s window, and writes `clips_manifest.json`
-   (including your `subtitle_options`).
-2. **Burn** (`burn_subtitles.py`) — for each clip: transcribes just that clip, runs
-   **only** the language step your captions need (translate for English/dual,
-   transliterate for Hinglish, titles if enabled), then does a single ffmpeg pass that
-   seeks into the source, scales/pads to 1080×1920, and burns the chosen captions.
-   With subtitles off, transcription is skipped entirely.
+1. **Select** (`select_clips.py`) — downloads the source, transcribes it, asks the LLM
+   for the best moments (guided by your brief), snaps each to sentence boundaries, and
+   writes `clips_manifest.json`.
+2. **Burn** (`burn_subtitles.py`) — per clip: transcribes it, runs only the language
+   pass your captions need, then a single ffmpeg pass that seeks into the source,
+   scales to 1080×1920 and burns the captions.
 
-The options travel: **front-end → `app.py` → `select_clips.py` → manifest → `burn_subtitles.py`.**
-`app.py` itself needs no changes to support any of the caption settings.
+Options travel: **web page → `app.py` → `select_clips.py` → manifest → `burn_subtitles.py`.**
 
----
-
-## Caption rendering CLI (optional)
-
-You can re-render a job's clips without re-selecting, and override the manifest's
-caption settings on the fly:
-
-```bash
-# Use whatever is saved in the manifest:
-python burn_subtitles.py /path/to/job_dir
-
-# Override on the command line:
-python burn_subtitles.py /path/to/job_dir --layout single --language english --position bottom --style karaoke --accent "#2EE640"
-python burn_subtitles.py /path/to/job_dir --style word_pop --accent "#FF4FD8"
-python burn_subtitles.py /path/to/job_dir --layout dual --title
-python burn_subtitles.py /path/to/job_dir --no-burn        # clean clips, no captions
-```
-
-Flags: `--no-burn`, `--layout {single,dual}`, `--language {hindi,english,hinglish}`,
-`--position {top,middle,bottom,below}`, `--style {outline,box,white_box,bold_yellow,karaoke,word_pop}`,
-`--accent "#RRGGBB"`, `--title`, `--manifest PATH`.
+`providers.py` holds every fallback chain — add a provider there and the whole pipeline
+picks it up.
 
 ---
 
-## Fast iteration — preview captions without the server
-
-`test_captions.py` renders caption styles/positions directly on a local clip, so you
-can eyeball changes in seconds instead of running the whole pipeline. It needs **no API
-keys** (the Groq/Deepgram SDKs are stubbed and synthetic transcript text is fed in) and
-**no server** — you're testing the rendering, which is what changes most.
-
-```bash
-# render all 5 styles on one local clip, bottom position
-python test_captions.py myclip.mp4
-
-# pick specific styles/positions, choose an accent colour
-python test_captions.py myclip.mp4 --styles karaoke,word_pop --positions bottom,top --accent "#2EE640"
-
-# test the dual layout, or your own caption text
-python test_captions.py myclip.mp4 --layout dual
-python test_captions.py myclip.mp4 --text "Your caption line here"
-```
-
-It writes to `caption_preview/`: one `clip_<style>_<pos>.mp4` and `frame_<style>_<pos>.png`
-per variant, plus `_contact_sheet.png` — a single labelled grid of every variant so you
-can compare looks at a glance. So your loop becomes: **drop in the new `burn_subtitles.py`
-→ run this → look.** (`myclip.mp4` can be any short video — one of your already-rendered
-Shorts works fine.)
-
-To cut the file-shuffling further:
-- Run the server with auto-reload so you don't restart it after each edit:
-  `uvicorn app:app --reload`
-- Keep the project in git so applying an update is a reviewable diff you can revert.
-
----
-
-
+## API
 
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/` | Web UI |
-| POST | `/process/url` | One-shot: select + burn from a URL |
-| POST | `/process/upload` | One-shot: select + burn from an uploaded file |
+| GET | `/api/status` | Provider/key/ffmpeg readiness |
+| POST | `/api/settings` | Save API keys (localhost only) |
+| POST | `/process/url` · `/process/upload` | Full pipeline |
 | POST | `/select-clips/url` · `/select-clips/upload` | Selection only |
 | POST | `/burn-subtitles/{job_id}` | Burn an already-selected job |
 | GET | `/jobs/{job_id}` | Job status |
 | GET | `/jobs/{job_id}/clips` · `/clips.zip` · `/clips/{filename}` | Results |
 | GET | `/jobs/{job_id}/highlights` | Selected segments |
-| DELETE | `/jobs/{job_id}` | Remove a job (optionally keep files) |
+| DELETE | `/jobs/{job_id}` | Remove a job (`?keep_files=true` to keep files) |
 | GET | `/health` | Health check |
 
-Pass caption settings in the `options` object, e.g.:
+Example `options` payload:
 
 ```json
 {
+  "clip_prompt": "Only moments about failure and bouncing back",
   "num_clips": "auto",
-  "min_clip_len": 20,
-  "max_clip_len": 40,
+  "clip_mode": "multi",
   "burn_subtitles": true,
   "subtitle_layout": "single",
   "subtitle_language": "hinglish",
-  "subtitle_position": "middle",
+  "subtitle_position": "bottom",
   "caption_style": "karaoke",
-  "caption_accent": "#FFE600",
-  "show_title": false
+  "caption_accent": "#FFE600"
 }
 ```
 
 ---
 
+## Caption CLI (optional)
+
+Re-render a job's clips without re-selecting:
+
+```bash
+python burn_subtitles.py output/<job_id> --style karaoke --accent "#2EE640"
+python burn_subtitles.py output/<job_id> --layout dual --title
+python burn_subtitles.py output/<job_id> --no-burn        # clean clips, no captions
+```
+
+Preview caption styles on any local clip without API keys or the server:
+
+```bash
+python test_captions.py myclip.mp4 --styles karaoke,word_pop
+```
+
+Writes a labelled contact sheet to `caption_preview/` so you can compare looks at a glance.
+
+---
+
+## Private / age-restricted videos
+
+Some YouTube links need your session cookies. Export them with a
+"Get cookies.txt" browser extension and save the file as `cookies.txt` in the project
+folder — it's picked up automatically and is git-ignored.
+
+**Treat that file like a password**: it grants access to your YouTube account. Never
+commit or share it.
+
+---
+
 ## Troubleshooting
 
-- **Hindi shows as boxes / blank** → no Devanagari font found. Add one under `fonts/`
-  (see [Fonts](#fonts-important)); check the diagnostic log for the `WARNING`.
-- **`python-multipart` error on upload** → `pip install python-multipart`.
-- **All clips the same length** → expected variety is within 20–40s; widen with
-  `min_clip_len`/`max_clip_len` if you want a bigger spread.
-- **Deepgram errors** → leave `DEEPGRAM_API_KEY` unset to fall back to the Whisper slice.
-- **Per-job logs** → each job writes a `SUBTITLE_DIAGNOSTIC_REPORT.txt` in its job dir.
+- **Hindi shows as boxes** → no Devanagari font. Re-run `python3 run.py` to fetch fonts.
+- **"Sign in to confirm you're not a bot"** → add a fresh `cookies.txt` (above).
+- **Everything rate-limited** → add a Gemini or OpenRouter key in Setup; they take over
+  automatically.
+- **Captions came out blank** → the translation provider was down; the job falls back to
+  Hindi captions. Check `SUBTITLE_DIAGNOSTIC_REPORT.txt` in the job folder.
+- **Per-job logs** → every job writes `DIAGNOSTIC_REPORT.txt` and
+  `SUBTITLE_DIAGNOSTIC_REPORT.txt` into `output/<job_id>/`.
 
 ---
 
 ## Notes
 
-- The pipeline assumes **Hindi source audio** (Deepgram language is `hi`). English is a
-  translation of it; Hinglish is a romanisation of it.
-- `index.html` is served from `templates/index.html` by `app.py`.
+- The pipeline assumes **Hindi source audio**. English is a translation of it;
+  Hinglish is a romanisation of it.
+- Clips and downloads are kept until you delete a job from the page — nothing is
+  cleaned up behind your back.

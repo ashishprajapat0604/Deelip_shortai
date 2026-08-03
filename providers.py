@@ -8,12 +8,19 @@ limits, network blips) must never sink a job. Every capability here is a
 
 Capabilities
 ------------
-  chat()                  Text/JSON completion. Chain: Groq -> Google Gemini.
+  chat()                  Text/JSON completion. Chain: Groq -> Gemini ->
+                          OpenRouter -> local Ollama. Order: CHAT_ORDER env.
   transcribe_audio()      Word-level transcription. Chain: Groq Whisper ->
                           Deepgram nova-3 -> local faster-whisper (offline).
+                          Order: TRANSCRIBE_ORDER env.
+  run_cmd()               subprocess with a timeout and retry/backoff, so a
+                          transient ffmpeg/yt-dlp failure is retried instead of
+                          killing the job.
   select_video_encoder()  Picks the fastest available ffmpeg encoder
                           (NVENC -> AMF -> QSV -> libx264), with a hard CPU
                           fallback that ALWAYS works.
+  provider_status()       What is actually configured/reachable right now —
+                          powers the UI's provider badges.
 
 All functions degrade gracefully: missing API key / missing package / provider
 error simply moves on to the next link in the chain.
@@ -23,7 +30,17 @@ import os
 import re
 import json
 import time
+import shutil
 import subprocess
+
+# Load .env here rather than only in app.py: every entry point (the server, the
+# burn_subtitles.py CLI, run.py's self-test) imports this module, so keys are
+# always present no matter how the pipeline is started.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+except Exception:
+    pass
 
 
 # ─────────────────────────────────────────────────────────────
@@ -112,20 +129,110 @@ def _gemini_chat(prompt, temperature, json_mode, log):
     return None
 
 
-def chat(prompt, temperature=0.2, json_mode=False, log=None, groq_models=None):
-    """Run a single-prompt completion, trying Groq first then Gemini.
+def _openrouter_chat(prompt, temperature, json_mode, log):
+    """OpenRouter fallback — one key fronts dozens of models, including free ones.
+    Uses plain HTTP so no extra SDK is needed. Returns text or None."""
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+    if not api_key:
+        return None
+    import urllib.request
+    import urllib.error
 
-    Returns the raw response text (caller parses it), or "" if every provider
-    failed. `json_mode=True` asks the provider for strict JSON output.
+    model = os.environ.get("OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free")
+    body = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": temperature,
+    }
+    if json_mode:
+        body["response_format"] = {"type": "json_object"}
+    data = json.dumps(body).encode("utf-8")
+
+    for attempt in range(1, 3):
+        try:
+            req = urllib.request.Request(
+                "https://openrouter.ai/api/v1/chat/completions",
+                data=data,
+                headers={"Authorization": f"Bearer {api_key}",
+                         "Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                parsed = json.loads(resp.read().decode("utf-8"))
+            return (parsed["choices"][0]["message"]["content"] or "").strip()
+        except urllib.error.HTTPError as e:
+            if e.code in _NON_RETRYABLE:
+                _say(log, f"    [chat] openrouter: non-retryable {e.code}")
+                return None
+            _say(log, f"    [chat] openrouter attempt {attempt} failed: HTTP {e.code}")
+            time.sleep(2 * attempt)
+        except Exception as e:
+            _say(log, f"    [chat] openrouter attempt {attempt} failed: {e}")
+            time.sleep(2 * attempt)
+    return None
+
+
+def _ollama_chat(prompt, temperature, json_mode, log):
+    """Local Ollama fallback — no API key, no network, no rate limits. This is the
+    last resort that keeps text tasks alive when every hosted provider is down.
+    Only attempted when a local Ollama server is actually reachable."""
+    import urllib.request
+    import urllib.error
+
+    host = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
+    model = os.environ.get("OLLAMA_MODEL", "llama3.1")
+    body = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "options": {"temperature": temperature},
+    }
+    if json_mode:
+        body["format"] = "json"
+    try:
+        req = urllib.request.Request(
+            f"{host}/api/generate",
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            parsed = json.loads(resp.read().decode("utf-8"))
+        return (parsed.get("response") or "").strip()
+    except Exception as e:
+        _say(log, f"    [chat] ollama unavailable at {host}: {e}")
+        return None
+
+
+DEFAULT_CHAT_ORDER = "groq,gemini,openrouter,ollama"
+
+
+def chat(prompt, temperature=0.2, json_mode=False, log=None, groq_models=None):
+    """Run a single-prompt completion through the whole provider chain.
+
+    Order is configurable via env CHAT_ORDER (comma list of
+    groq,gemini,openrouter,ollama). Returns the raw response text (caller parses
+    it), or "" if every provider failed. `json_mode=True` asks for strict JSON.
     """
     models = groq_models or DEFAULT_GROQ_MODELS
-    out = _groq_chat(prompt, temperature, json_mode, models, log)
-    if out:
-        return out
-    _say(log, "    [chat] Groq exhausted -> falling back to Gemini")
-    out = _gemini_chat(prompt, temperature, json_mode, log)
-    if out:
-        return out
+    engines = {
+        "groq": lambda: _groq_chat(prompt, temperature, json_mode, models, log),
+        "gemini": lambda: _gemini_chat(prompt, temperature, json_mode, log),
+        "openrouter": lambda: _openrouter_chat(prompt, temperature, json_mode, log),
+        "ollama": lambda: _ollama_chat(prompt, temperature, json_mode, log),
+    }
+    order_str = os.environ.get("CHAT_ORDER", DEFAULT_CHAT_ORDER)
+    order = [o.strip().lower() for o in order_str.split(",") if o.strip()]
+
+    for i, name in enumerate(order):
+        fn = engines.get(name)
+        if not fn:
+            continue
+        out = fn()
+        if out:
+            if i > 0:
+                _say(log, f"    [chat] recovered via fallback provider '{name}'")
+            return out
+        if i + 1 < len(order):
+            _say(log, f"    [chat] '{name}' unavailable -> trying '{order[i + 1]}'")
     _say(log, "    [chat] ALL chat providers failed (returning empty)")
     return ""
 
@@ -195,35 +302,48 @@ def _deepgram_transcribe(audio_path, language, log):
     except Exception:
         return None
 
-    try:
-        _say(log, "  [transcribe] Deepgram nova-3")
-        client = DeepgramClient(api_key=api_key)
-        with open(audio_path, "rb") as f:
-            buf = f.read()
-        response = client.listen.v1.media.transcribe_file(
-            request=buf, model="nova-3", language=language,
-            smart_format=True, utterances=True,
-        )
-        if hasattr(response, "to_dict"):
-            data = response.to_dict()
-        elif hasattr(response, "model_dump"):
-            data = response.model_dump()
-        else:
-            data = json.loads(response.json())
+    with open(audio_path, "rb") as f:
+        buf = f.read()
 
-        out = {"segments": []}
-        for u in data.get("results", {}).get("utterances", []):
-            seg = {"start": u.get("start"), "end": u.get("end"),
-                   "text": u.get("transcript"), "words": []}
-            for w in u.get("words", []):
-                seg["words"].append({"word": w.get("punctuated_word", w.get("word")),
-                                     "start": w.get("start"), "end": w.get("end")})
-            out["segments"].append(seg)
-        if out["segments"]:
-            out["_engine"] = "deepgram:nova-3"
-            return out
-    except Exception as e:
-        _say(log, f"  [transcribe] Deepgram failed: {e}")
+    # nova-3 is the best model but occasionally 500s; nova-2 is the proven fallback.
+    for model in ("nova-3", "nova-2"):
+        for attempt in range(1, 3):
+            try:
+                _say(log, f"  [transcribe] Deepgram {model} attempt {attempt}/2")
+                # api_key MUST be passed explicitly: deepgram-sdk 7.x dropped the
+                # no-arg constructor's env lookup, which silently broke transcription.
+                client = DeepgramClient(api_key=api_key)
+                response = client.listen.v1.media.transcribe_file(
+                    request=buf, model=model, language=language,
+                    smart_format=True, utterances=True,
+                )
+                if hasattr(response, "to_dict"):
+                    data = response.to_dict()
+                elif hasattr(response, "model_dump"):
+                    data = response.model_dump()
+                else:
+                    data = json.loads(response.json())
+
+                out = {"segments": []}
+                for u in data.get("results", {}).get("utterances", []):
+                    seg = {"start": u.get("start"), "end": u.get("end"),
+                           "text": u.get("transcript"), "words": []}
+                    for w in u.get("words", []):
+                        seg["words"].append({"word": w.get("punctuated_word", w.get("word")),
+                                             "start": w.get("start"), "end": w.get("end")})
+                    out["segments"].append(seg)
+                if out["segments"]:
+                    out["_engine"] = f"deepgram:{model}"
+                    return out
+                _say(log, f"  [transcribe] Deepgram {model} returned no utterances")
+                break
+            except Exception as e:
+                status = getattr(e, "status_code", None)
+                if status in _NON_RETRYABLE:
+                    _say(log, f"  [transcribe] Deepgram {model}: non-retryable {status}: {e}")
+                    return None
+                _say(log, f"  [transcribe] Deepgram {model} attempt {attempt} failed: {e}")
+                time.sleep(2 * attempt)
     return None
 
 
@@ -298,6 +418,86 @@ def transcribe_audio(audio_path, language="hi", log=None, prefer=None):
             return data
     _say(log, "  [transcribe] ALL transcription providers failed")
     return None
+
+
+# ─────────────────────────────────────────────────────────────
+# SUBPROCESS with timeout + retry
+# ─────────────────────────────────────────────────────────────
+
+def run_cmd(cmd, timeout=None, retries=1, backoff=3, log=None, label=""):
+    """Run an external command with a hard timeout and optional retries.
+
+    A hung ffmpeg/yt-dlp would otherwise block a worker thread forever, so every
+    external call in the pipeline goes through here. Returns the final
+    CompletedProcess (returncode != 0 on failure); a timeout is reported as
+    returncode 124 rather than raising, so callers handle one failure shape.
+    """
+    label = label or (cmd[0] if cmd else "cmd")
+    last = None
+    for attempt in range(1, max(1, retries) + 1):
+        try:
+            last = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            if last.returncode == 0:
+                return last
+            _say(log, f"    [{label}] attempt {attempt}/{retries} failed "
+                      f"(rc={last.returncode}): {(last.stderr or '').strip()[-200:]}")
+        except subprocess.TimeoutExpired:
+            _say(log, f"    [{label}] attempt {attempt}/{retries} TIMED OUT after {timeout}s")
+            last = subprocess.CompletedProcess(cmd, 124, "", f"timed out after {timeout}s")
+        except FileNotFoundError as e:
+            # Missing binary — retrying cannot help.
+            return subprocess.CompletedProcess(cmd, 127, "", str(e))
+        except Exception as e:
+            _say(log, f"    [{label}] attempt {attempt}/{retries} errored: {e}")
+            last = subprocess.CompletedProcess(cmd, 1, "", str(e))
+        if attempt < retries:
+            time.sleep(backoff * attempt)
+    return last
+
+
+def have_binary(name):
+    return shutil.which(name) is not None
+
+
+# ─────────────────────────────────────────────────────────────
+# PROVIDER STATUS  (drives the setup screen / provider badges)
+# ─────────────────────────────────────────────────────────────
+
+def provider_status():
+    """Report which capabilities are actually usable right now.
+
+    Purely local inspection (keys + installed packages + binaries) — no network
+    calls, so it is cheap enough for the UI to poll.
+    """
+    def _key(*names):
+        return any((os.environ.get(n) or "").strip() for n in names)
+
+    def _mod(name):
+        try:
+            __import__(name)
+            return True
+        except Exception:
+            return False
+
+    chat_providers = {
+        "groq": _key("GROQ_API_KEY"),
+        "gemini": _key("GEMINI_API_KEY", "GOOGLE_API_KEY") and _mod("google.generativeai"),
+        "openrouter": _key("OPENROUTER_API_KEY"),
+        "ollama": False,   # probed lazily; treated as bonus, never required
+    }
+    transcribe_providers = {
+        "groq": _key("GROQ_API_KEY"),
+        "deepgram": _key("DEEPGRAM_API_KEY") and _mod("deepgram"),
+        "local": _mod("faster_whisper"),
+    }
+    return {
+        "chat": chat_providers,
+        "transcribe": transcribe_providers,
+        "chat_ready": any(chat_providers.values()),
+        "transcribe_ready": any(transcribe_providers.values()),
+        "ffmpeg": have_binary("ffmpeg") and have_binary("ffprobe"),
+        "ytdlp": have_binary("yt-dlp"),
+    }
 
 
 # ─────────────────────────────────────────────────────────────

@@ -8,12 +8,12 @@ import threading
 import traceback
 from typing import Optional
 from uuid import uuid4
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
+import providers
 import select_clips
 import burn_subtitles
-
 
 
 # ─────────────────────────────────────────────────────────────
@@ -22,30 +22,76 @@ import burn_subtitles
 
 app = FastAPI(title="Viral Clip Pipeline API")
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
+OUTPUT_DIR = os.path.join(BASE_DIR, "output")
+ENV_PATH = os.path.join(BASE_DIR, ".env")
+JOBS_INDEX = os.path.join(OUTPUT_DIR, "_jobs.json")
 
-UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
-os.makedirs("output", exist_ok=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# In-memory job tracking: job_id -> status dict
-# For production, replace with a real datastore (DB/Redis).
+# job_id -> status dict. Mirrored to JOBS_INDEX on every write so a server restart
+# doesn't lose finished jobs and their downloadable clips.
 JOBS = {}
 JOBS_LOCK = threading.Lock()
 
-@app.get("/", tags=["UI"])
-def serve_frontend():
-    """Serves the main frontend UI."""
-    return FileResponse("templates/index.html")
+# Fields that are large or meaningless after a restart — never persisted.
+_TRANSIENT_JOB_FIELDS = ("raw_clips", "highlights", "error")
+
+
+def _persist_jobs_locked():
+    """Write the job index to disk. Caller must already hold JOBS_LOCK."""
+    try:
+        slim = {
+            jid: {k: v for k, v in job.items() if k not in _TRANSIENT_JOB_FIELDS}
+            for jid, job in JOBS.items()
+        }
+        tmp = JOBS_INDEX + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(slim, f, ensure_ascii=False)
+        os.replace(tmp, JOBS_INDEX)   # atomic: a crash mid-write can't corrupt the index
+    except OSError:
+        pass   # persistence is best-effort; never break a running job over it
+
+
+def _load_jobs():
+    """Restore the job index at startup. Jobs that were mid-flight when the server
+    stopped are marked failed — their worker threads are gone, so they can never
+    progress and would otherwise show a spinner forever."""
+    if not os.path.exists(JOBS_INDEX):
+        return
+    try:
+        with open(JOBS_INDEX, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return
+    for jid, job in saved.items():
+        if job.get("status") in ("queued", "running", "selected"):
+            job["status"] = "failed"
+            job["message"] = "Interrupted — the server restarted while this job was running."
+        JOBS[jid] = job
+
 
 def _set_job(job_id: str, **kwargs):
     with JOBS_LOCK:
         JOBS.setdefault(job_id, {})
         JOBS[job_id].update(kwargs)
+        _persist_jobs_locked()
 
 
 def _get_job(job_id: str) -> Optional[dict]:
     with JOBS_LOCK:
         return JOBS.get(job_id)
+
+
+_load_jobs()
+
+
+@app.get("/", tags=["UI"])
+def serve_frontend():
+    """Serves the main frontend UI."""
+    return FileResponse(os.path.join(BASE_DIR, "templates", "index.html"))
 
 
 # ─────────────────────────────────────────────────────────────
@@ -124,6 +170,7 @@ def _run_subtitles(job_id: str, job_dir: str):
                         "download_url": f"/jobs/{job_id}/clips/{fname}",
                         "reason": reason,
                     })
+                    _persist_jobs_locked()
 
         final_clips, log_path = burn_subtitles.execute_subtitle_workflow(
             job_dir=job_dir,
@@ -474,3 +521,150 @@ def delete_job(job_id: str, keep_files: bool = False):
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+# ─────────────────────────────────────────────────────────────
+# Setup: provider status + API keys
+# ─────────────────────────────────────────────────────────────
+
+# Keys the setup screen can manage. label/help drive the UI; `required` marks the
+# ones without which nothing works at all.
+MANAGED_KEYS = [
+    {"key": "GROQ_API_KEY", "label": "Groq", "required": True,
+     "help": "Free. Powers transcription + AI selection.", "url": "https://console.groq.com/keys"},
+    {"key": "DEEPGRAM_API_KEY", "label": "Deepgram", "required": False,
+     "help": "Optional. Best Hindi caption accuracy.", "url": "https://console.deepgram.com/signup"},
+    {"key": "GEMINI_API_KEY", "label": "Google Gemini", "required": False,
+     "help": "Optional fallback when Groq is rate-limited.", "url": "https://aistudio.google.com/apikey"},
+    {"key": "OPENROUTER_API_KEY", "label": "OpenRouter", "required": False,
+     "help": "Optional last-resort text fallback.", "url": "https://openrouter.ai/keys"},
+]
+_MANAGED_KEY_NAMES = {k["key"] for k in MANAGED_KEYS}
+
+
+class SettingsRequest(BaseModel):
+    keys: dict
+
+
+def _mask(value: str) -> str:
+    """Show only enough of a key to recognise it — never echo a secret back in full."""
+    v = (value or "").strip()
+    if not v:
+        return ""
+    return f"{v[:4]}…{v[-4:]}" if len(v) > 12 else "…" * len(v)
+
+
+def _require_local(request: Request):
+    """Reject key management from anywhere but this machine.
+
+    The server is often started with --host 0.0.0.0 to reach it from a phone, which
+    would otherwise expose an unauthenticated write-secrets-to-disk endpoint to the
+    whole network. Set ALLOW_REMOTE_SETTINGS=1 only on a trusted network."""
+    if (os.environ.get("ALLOW_REMOTE_SETTINGS") or "").strip() == "1":
+        return
+    host = (request.client.host if request.client else "") or ""
+    if host not in ("127.0.0.1", "::1", "localhost"):
+        raise HTTPException(
+            status_code=403,
+            detail="API keys can only be changed from the machine running ShortsAI. "
+                   "Open http://localhost:8000 there, or edit the .env file directly.",
+        )
+
+
+def _read_env_file() -> dict:
+    """Parse .env into a dict, preserving nothing else about the file."""
+    out = {}
+    if not os.path.exists(ENV_PATH):
+        return out
+    try:
+        with open(ENV_PATH, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                out[k.strip()] = v.strip()
+    except OSError:
+        pass
+    return out
+
+
+def _write_env_file(values: dict):
+    """Rewrite .env with `values` merged in, keeping any unmanaged keys the user added."""
+    existing = _read_env_file()
+    existing.update(values)
+    lines = ["# ShortsAI configuration — managed by the in-app setup screen.\n"]
+    for entry in MANAGED_KEYS:
+        lines.append(f"{entry['key']}={existing.get(entry['key'], '')}\n")
+    for k, v in existing.items():
+        if k not in _MANAGED_KEY_NAMES:
+            lines.append(f"{k}={v}\n")
+    tmp = ENV_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.writelines(lines)
+    os.replace(tmp, ENV_PATH)
+    try:
+        os.chmod(ENV_PATH, 0o600)   # the file holds secrets — keep it owner-only
+    except OSError:
+        pass
+
+
+@app.get("/api/status")
+def api_status():
+    """What is configured and working right now — drives the UI's setup panel."""
+    status = providers.provider_status()
+    env = _read_env_file()
+    keys = [{
+        "key": e["key"],
+        "label": e["label"],
+        "required": e["required"],
+        "help": e["help"],
+        "url": e["url"],
+        "set": bool((os.environ.get(e["key"]) or env.get(e["key"]) or "").strip()),
+        "masked": _mask(os.environ.get(e["key"]) or env.get(e["key"]) or ""),
+    } for e in MANAGED_KEYS]
+
+    fonts_dir = os.path.join(BASE_DIR, "fonts")
+    font_count = len([f for f in os.listdir(fonts_dir)
+                      if f.lower().endswith(".ttf")]) if os.path.isdir(fonts_dir) else 0
+
+    return {
+        "ready": status["chat_ready"] and status["transcribe_ready"] and status["ffmpeg"],
+        "providers": status,
+        "keys": keys,
+        "fonts": font_count,
+    }
+
+
+@app.post("/api/settings")
+def api_save_settings(payload: SettingsRequest, request: Request):
+    """Save API keys to .env and apply them to the running process immediately, so
+    the user never has to restart the server or touch a text editor."""
+    _require_local(request)
+
+    updates = {}
+    for k, v in (payload.keys or {}).items():
+        if k not in _MANAGED_KEY_NAMES:
+            continue
+        value = (v or "").strip()
+        # The UI sends back the masked placeholder for untouched fields; ignore those
+        # so redisplaying the form can't overwrite a real key with its own mask.
+        if "…" in value:
+            continue
+        updates[k] = value
+
+    if not updates:
+        raise HTTPException(status_code=400, detail="No recognised keys to update")
+
+    try:
+        _write_env_file(updates)
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"Could not write .env: {e}")
+
+    for k, v in updates.items():
+        if v:
+            os.environ[k] = v
+        else:
+            os.environ.pop(k, None)
+
+    return {"saved": sorted(updates.keys()), "status": api_status()}

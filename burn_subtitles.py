@@ -9,9 +9,6 @@ import traceback
 import datetime
 import subprocess
 import argparse
-from groq import Groq
-# Note: PrerecordedOptions is removed in Deepgram SDK v5.0.0+
-from deepgram import DeepgramClient
 import providers
 
 # ─────────────────────────────────────────────────────────────
@@ -83,29 +80,6 @@ class DiagnosticLog:
 # Audio extraction
 # ─────────────────────────────────────────────────────────────
 
-def extract_audio(video_path: str, output_path: str, log: DiagnosticLog) -> str:
-    log.log(f"[Audio] Extracting audio from: {video_path}")
-    log.log(f"        Video file exists: {os.path.exists(video_path)}")
-    log.log(f"        Video file size:   {os.path.getsize(video_path) if os.path.exists(video_path) else 'N/A'} bytes")
-
-    if not os.path.exists(video_path):
-        raise FileNotFoundError(f"Video not found: {video_path}")
-
-    command = [
-        "ffmpeg", "-y",
-        "-i", video_path,
-        "-vn", "-ar", "44100", "-ac", "1", "-ab", "64k", "-f", "mp3",
-        output_path,
-    ]
-    result = subprocess.run(command, capture_output=True, text=True)
-    log.log(f"        FFmpeg return code: {result.returncode}")
-    if result.returncode != 0:
-        log.error(f"FFmpeg audio extraction failed:\n{result.stderr}")
-        raise RuntimeError(f"FFmpeg audio extraction failed:\n{result.stderr}")
-    log.log(f"        Audio saved: {output_path}  ({os.path.getsize(output_path)} bytes)")
-    return output_path
-
-
 def _extract_clip_audio(source_video: str, output_path: str,
                         start: float, end: float, log: DiagnosticLog) -> str:
     """Extract ONLY the [start, end] slice of audio from the source video to mp3,
@@ -117,83 +91,11 @@ def _extract_clip_audio(source_video: str, output_path: str,
     if start is not None and end is not None:
         cmd += ["-ss", f"{float(start):.3f}", "-to", f"{float(end):.3f}"]
     cmd += ["-i", source_video, "-vn", "-ar", "16000", "-ac", "1", "-f", "mp3", output_path]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = providers.run_cmd(cmd, timeout=600, retries=2, log=log, label="ffmpeg-clipaudio")
     if result.returncode != 0:
-        raise RuntimeError(f"Clip audio extraction failed:\n{result.stderr[-800:]}")
+        raise RuntimeError(f"Clip audio extraction failed:\n{(result.stderr or '')[-800:]}")
     return output_path
 
-
-# ─────────────────────────────────────────────────────────────
-# Per-clip Deepgram transcription (SDK v5.0.0+)
-# ─────────────────────────────────────────────────────────────
-
-def _deepgram_transcribe(audio_path: str, log: DiagnosticLog) -> dict:
-    """Calls Deepgram nova-3 on the given audio file and returns parsed JSON
-    mapped to the exact same 'segments' + 'words' structure expected by the pipeline."""
-    api_key = os.environ.get("DEEPGRAM_API_KEY")
-    if not api_key:
-        raise ValueError("DEEPGRAM_API_KEY is missing from environment!")
-
-    client = DeepgramClient(api_key=api_key)
-
-    with open(audio_path, "rb") as f:
-        buffer_data = f.read()
-
-    # V5.0.0 API Call format
-    # nova-3 has significantly better multilingual (incl. Hindi) accuracy than nova-2
-    response = client.listen.v1.media.transcribe_file(
-        request=buffer_data,
-        model="nova-3",
-        language="hi",
-        smart_format=True,
-        utterances=True,
-    )
-    
-    # FIX: Safely convert the Pydantic response object to a dictionary
-    if hasattr(response, "to_dict"):
-        data = response.to_dict()
-    elif hasattr(response, "model_dump"):
-        data = response.model_dump() # Pydantic v2
-    else:
-        data = json.loads(response.json()) # Pydantic v1
-
-    # Map Deepgram's 'utterances' into the standard Whisper 'segments' format
-    whisper_format = {"segments": []}
-    utterances = data.get("results", {}).get("utterances", [])
-
-    for u in utterances:
-        segment = {
-            "start": u.get("start"),
-            "end": u.get("end"),
-            "text": u.get("transcript"),
-            "words": []
-        }
-        
-        # Prefer the punctuated word if available for cleaner subtitles
-        for w in u.get("words", []):
-            segment["words"].append({
-                "word": w.get("punctuated_word", w.get("word")),
-                "start": w.get("start"),
-                "end": w.get("end")
-            })
-            
-        whisper_format["segments"].append(segment)
-
-    # Fallback mapper just in case utterances array is empty but raw words exist
-    if not whisper_format["segments"]:
-        channels = data.get("results", {}).get("channels", [])
-        if channels and channels[0].get("alternatives"):
-            alt = channels[0]["alternatives"][0]
-            words = alt.get("words", [])
-            if words:
-                whisper_format["segments"].append({
-                    "start": words[0].get("start"),
-                    "end": words[-1].get("end"),
-                    "text": alt.get("transcript"),
-                    "words": [{"word": w.get("punctuated_word", w.get("word")), "start": w.get("start"), "end": w.get("end")} for w in words]
-                })
-
-    return whisper_format
 
 
 def _slice_transcript(full_transcript_path: str, clip_start: float, clip_end: float) -> dict:
@@ -258,10 +160,10 @@ def transcribe_clip(audio_path: str, job_dir: str, clip_index: int, log: Diagnos
                 f"(no Deepgram call)")
         data = _slice_transcript(full_transcript_path, clip_start, clip_end)
     else:
-        # ── Slow path: fresh Deepgram call ──
-        log.log(f"[Clip {clip_index}] Transcribing clip audio with Deepgram nova-3 "
+        # ── Slow path: fresh transcription through the full provider chain ──
+        log.log(f"[Clip {clip_index}] Transcribing clip audio "
                 f"({'no full transcript found' if full_transcript_path is None else 'no timestamps given'})...")
-        data = _deepgram_transcribe(audio_path, log)
+        data = providers.transcribe_audio(audio_path, language="hi", log=log) or {"segments": []}
 
     segments = data.get("segments", [])
     words_total = sum(len(s.get("words", [])) for s in segments)
@@ -496,15 +398,8 @@ CLIPS:\n""" + bulk
 
 
 # ─────────────────────────────────────────────────────────────
-# SRT helpers (built from a CLIP-LOCAL transcript, no time remap needed)
+# ASS timing helpers (built from a CLIP-LOCAL transcript, no time remap needed)
 # ─────────────────────────────────────────────────────────────
-
-def _fmt_srt_time(seconds: float) -> str:
-    frac = int((seconds % 1) * 1000)
-    s = int(seconds)
-    m, s = divmod(s, 60)
-    h, m = divmod(m, 60)
-    return f"{h:02d}:{m:02d}:{s:02d},{frac:03d}"
 
 def _fmt_ass_time(seconds: float) -> str:
     if seconds < 0:
@@ -696,11 +591,11 @@ def _position_layout(position, video_box):
 def _probe_dimensions(path, log):
     """Return (width, height) of the first video stream, or (None, None)."""
     try:
-        r = subprocess.run(
+        r = providers.run_cmd(
             ["ffprobe", "-v", "error", "-select_streams", "v:0",
              "-show_entries", "stream=width,height", "-of", "csv=p=0", path],
-            capture_output=True, text=True)
-        parts = r.stdout.strip().split(",")
+            timeout=60, retries=2, log=log, label="ffprobe")
+        parts = (r.stdout or "").strip().split(",")
         return int(parts[0]), int(parts[1])
     except Exception:
         return None, None
@@ -1004,23 +899,6 @@ def make_caption_ass(segments: list, ass_path: str,
     return primary_count, secondary_count, has_title
 
 
-def _get_media_duration(path: str, log: DiagnosticLog) -> float:
-    """Returns duration in seconds via ffprobe, or None on failure."""
-    command = [
-        "ffprobe", "-v", "error",
-        "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1",
-        path,
-    ]
-    result = subprocess.run(command, capture_output=True, text=True)
-    if result.returncode != 0:
-        log.log(f"     ffprobe failed for {path}: {result.stderr.strip()}")
-        return None
-    try:
-        return float(result.stdout.strip())
-    except ValueError:
-        return None
-
 
 # ─────────────────────────────────────────────────────────────
 # FFmpeg render filter builder (9:16 Shorts canvas + dual subtitles)
@@ -1028,6 +906,10 @@ def _get_media_duration(path: str, log: DiagnosticLog) -> float:
 
 # YouTube Shorts canvas
 SHORTS_W, SHORTS_H = 1080, 1920
+
+# Hard ceiling on a single clip render, so one wedged ffmpeg can't hold a worker
+# thread (and the whole job) forever.
+RENDER_TIMEOUT = int(os.environ.get("RENDER_TIMEOUT", "1800"))
 
 def _escape_ffmpeg_path(path: str) -> str:
     path = path.replace("\\", "/")
@@ -1312,32 +1194,46 @@ def burn_subtitles_for_clip(raw_path: str, clip_index: int, job_dir: str, clips_
         # 4. SINGLE ffmpeg pass: seek into source (-ss/-to) + scale to 9:16 + (burn).
         # Input-seek BEFORE -i is fast (keyframe seek); we re-encode anyway so accuracy
         # is preserved by -to being applied on the trimmed input.
-        def _build_cmd(venc_args):
+        def _build_cmd(venc_args, filter_chain):
             cmd = ["ffmpeg", "-y"]
             if clip_start is not None and clip_end is not None:
                 cmd += ["-ss", f"{clip_start:.3f}", "-to", f"{clip_end:.3f}"]
-            cmd += ["-i", raw_path, "-vf", vf]
+            cmd += ["-i", raw_path, "-vf", filter_chain]
             cmd += venc_args
             cmd += ["-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", final_output]
             return cmd
 
         # Pick the fastest available encoder (NVENC -> AMF -> QSV -> libx264).
         venc_args, enc_name = providers.select_video_encoder(log)
-        command = _build_cmd(venc_args)
-        log.log(f"     FFmpeg ({enc_name}): {' '.join(command)}")
-        result = subprocess.run(command, capture_output=True, text=True)
 
-        # ROBUSTNESS: if a hardware encoder fails (driver/session limits/etc.), fall
-        # back to the always-available CPU encoder so a clip is NEVER lost to a GPU hiccup.
-        if result.returncode != 0 and enc_name != "cpu":
-            log.log(f"     HW encoder '{enc_name}' failed (rc={result.returncode}); "
-                    f"retrying with CPU libx264.\n     {result.stderr[-600:]}")
-            command = _build_cmd(providers.CPU_ENCODER_ARGS)
-            result = subprocess.run(command, capture_output=True, text=True)
+        # Render fallback ladder — each rung drops one thing that can fail, so a clip is
+        # only lost if even a plain CPU re-encode with no captions fails:
+        #   1. chosen encoder + captions
+        #   2. CPU encoder + captions   (GPU driver / session-limit failures)
+        #   3. CPU encoder, NO captions (broken ASS, missing font, libass error)
+        plain_vf = _build_render_filter("", "")
+        ladder = [(venc_args, enc_name, vf, "captions")]
+        if enc_name != "cpu":
+            ladder.append((providers.CPU_ENCODER_ARGS, "cpu", vf, "captions"))
+        if vf != plain_vf:
+            ladder.append((providers.CPU_ENCODER_ARGS, "cpu", plain_vf, "NO captions"))
 
-        if result.returncode != 0:
-            log.log(f"     FFMPEG STDERR:\n{result.stderr[-1500:]}")
-            log.log(f"     FAILED (return code {result.returncode})")
+        result = None
+        for enc_args, name, filter_chain, what in ladder:
+            command = _build_cmd(enc_args, filter_chain)
+            log.log(f"     FFmpeg ({name}, {what})")
+            result = providers.run_cmd(command, timeout=RENDER_TIMEOUT, retries=1,
+                                       log=log, label=f"ffmpeg-{name}")
+            if result.returncode == 0 and os.path.exists(final_output) \
+                    and os.path.getsize(final_output) >= 1000:
+                if what == "NO captions":
+                    log.log("     WARNING: rendered WITHOUT captions (caption burn kept failing).")
+                break
+            log.log(f"     render attempt failed (rc={result.returncode}) -> next fallback")
+
+        if result is None or result.returncode != 0:
+            log.log(f"     FFMPEG STDERR:\n{(result.stderr if result else '')[-1500:]}")
+            log.log(f"     FAILED (return code {result.returncode if result else 'n/a'})")
             return None
 
         if not os.path.exists(final_output) or os.path.getsize(final_output) < 1000:
@@ -1487,20 +1383,25 @@ def execute_subtitle_workflow(
                 segs = []
                 try:
                     if engine == "deepgram":
-                        # Cut just this clip's AUDIO from the source, transcribe it.
+                        # Cut just this clip's AUDIO from the source, then run the FULL
+                        # transcription chain on it (Deepgram -> Groq Whisper -> local).
                         try:
                             clip_audio = os.path.join(clips_dir, f"clip_{idx}_audio.mp3")
                             _extract_clip_audio(rc["raw_path"], clip_audio, cs, ce, log)
-                            segs = _deepgram_transcribe(clip_audio, log).get("segments", [])
+                            data = providers.transcribe_audio(
+                                clip_audio, language="hi", log=log,
+                                prefer=os.environ.get("CLIP_TRANSCRIBE_ORDER", "deepgram,groq,local"))
+                            segs = (data or {}).get("segments", [])
                             try: os.remove(clip_audio)
                             except OSError: pass
                         except Exception as dg_err:
-                            # ROBUSTNESS: a Deepgram 500/timeout on one clip must not blank
-                            # its captions — fall back to slicing the full Whisper transcript.
-                            log.log(f"   Clip {idx}: Deepgram failed ({dg_err}); "
+                            # ROBUSTNESS: a provider outage on one clip must not blank its
+                            # captions — fall back to slicing the full Whisper transcript.
+                            log.log(f"   Clip {idx}: per-clip transcription failed ({dg_err}); "
                                     f"falling back to whisper-slice")
                             segs = []
                         if not segs and os.path.exists(whisper_full) and cs is not None and ce is not None:
+                            log.log(f"   Clip {idx}: falling back to whisper-slice")
                             segs = _slice_transcript(whisper_full, cs, ce).get("segments", [])
                     elif os.path.exists(whisper_full) and cs is not None and ce is not None:
                         segs = _slice_transcript(whisper_full, cs, ce).get("segments", [])
@@ -1519,6 +1420,20 @@ def execute_subtitle_workflow(
                 batch_translate_clips(all_segment_lists, log)
             if need_translit:
                 batch_transliterate_clips(all_segment_lists, log)
+
+            # If the language pass produced nothing at all (every chat provider down),
+            # rendering would give blank captions. Falling back to the source Devanagari
+            # keeps captions on screen — and it needs the Hindi font, so switch language
+            # rather than leaving a Latin font to draw Devanagari as empty boxes.
+            if need_translate or need_translit:
+                key = "text_en" if need_translate else "text_hinglish"
+                got = sum(1 for segs in all_segment_lists for s in segs if (s.get(key) or "").strip())
+                if got == 0 and any(all_segment_lists):
+                    log.log(f"   WARNING: no '{key}' text was produced (chat providers "
+                            f"unavailable) — falling back to Hindi captions for this job.")
+                    if layout == "dual":
+                        layout = "single"
+                    language = "hindi"
             if show_title:
                 titles = batch_generate_titles(all_segment_lists, log)
                 clip_titles = {order[i]: titles[i] for i in range(len(order))}

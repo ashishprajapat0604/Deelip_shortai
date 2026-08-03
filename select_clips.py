@@ -1,14 +1,16 @@
 import os
 import sys
 import math
+import time
 import uuid
 import subprocess
 import json
 import traceback
 import datetime
 import gdown
-from groq import Groq
 import providers
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ─────────────────────────────────────────────────────────────
 # Diagnostic Logger
@@ -82,7 +84,20 @@ class DiagnosticLog:
 
 def download_from_gdrive(url: str, output_path: str, log: DiagnosticLog):
     log.log("[Step 1] Google Drive link - downloading via gdown...")
-    gdown.download(url, output_path, quiet=False)
+    last_err = None
+    for attempt in range(1, 4):
+        try:
+            gdown.download(url, output_path, quiet=False, fuzzy=True)
+            if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                break
+            last_err = RuntimeError("gdown produced no file")
+        except Exception as e:
+            last_err = e
+            log.log(f"         gdown attempt {attempt}/3 failed: {e}")
+            time.sleep(2 * attempt)
+    if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+        raise RuntimeError(f"Google Drive download failed: {last_err}")
+
     size = os.path.getsize(output_path)
     log.log(f"         Downloaded file size: {size} bytes")
     if size < 100_000:
@@ -105,26 +120,85 @@ def _ytdlp_format(quality: str) -> str:
     return "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
 
 
+def _ytdlp_binary() -> list:
+    """yt-dlp as a CLI if it is on PATH, else the module inside the current
+    interpreter — so a venv install works even when the console script isn't
+    exported to PATH."""
+    if providers.have_binary("yt-dlp"):
+        return ["yt-dlp"]
+    return [sys.executable, "-m", "yt_dlp"]
+
+
+DOWNLOAD_TIMEOUT = int(os.environ.get("DOWNLOAD_TIMEOUT", "3600"))
+
+
+def _download_with_ytdlp(url: str, output_path: str, log: DiagnosticLog,
+                         video_quality: str = "best") -> str:
+    """Download via yt-dlp, escalating through progressively more permissive
+    strategies. Each strategy fixes a different real-world failure:
+
+      1. cookies + requested quality      — normal path (age/login-gated videos)
+      2. no cookies                       — expired/broken cookies.txt
+      3. android player client            — bypasses most 'Sign in to confirm' walls
+      4. plain 'best'                     — format string matched nothing
+
+    Only strategy 1 uses cookies.txt, and only when the file actually exists, so a
+    missing cookies file no longer hard-fails every download.
+    """
+    base = _ytdlp_binary()
+    fmt = _ytdlp_format(video_quality)
+    cookies = os.path.join(BASE_DIR, "cookies.txt")
+    have_cookies = os.path.exists(cookies) and os.path.getsize(cookies) > 0
+
+    strategies = []
+    if have_cookies:
+        strategies.append(("cookies + requested quality", ["--cookies", cookies, "-f", fmt]))
+    strategies += [
+        ("no cookies", ["-f", fmt]),
+        ("android client", ["-f", fmt, "--extractor-args", "youtube:player_client=android"]),
+        ("any available format", ["-f", "best"]),
+    ]
+
+    last_err = ""
+    for name, extra in strategies:
+        log.log(f"[Step 1] yt-dlp strategy: {name}  (quality={video_quality})")
+        cmd = base + extra + [
+            "--no-playlist",
+            "--retries", "5",
+            "--fragment-retries", "10",
+            "--socket-timeout", "30",
+            "--merge-output-format", "mp4",
+            "-o", output_path,
+            url,
+        ]
+        result = providers.run_cmd(cmd, timeout=DOWNLOAD_TIMEOUT, retries=1,
+                                   log=log, label="yt-dlp")
+        if result.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 10_000:
+            log.log(f"         Video saved to: {output_path} "
+                    f"({os.path.getsize(output_path)//1024} KB) via '{name}'")
+            return output_path
+        last_err = (result.stderr or result.stdout or "")[-800:]
+        log.log(f"         strategy '{name}' failed -> trying next")
+        # A partial file from a failed attempt would confuse the next strategy.
+        if os.path.exists(output_path) and os.path.getsize(output_path) <= 10_000:
+            try:
+                os.remove(output_path)
+            except OSError:
+                pass
+
+    log.error(f"Every yt-dlp strategy failed. Last error:\n{last_err}")
+    raise RuntimeError(
+        "Video download failed. The link may be private, region-locked, or require "
+        "fresh cookies (see cookies.txt in the README)."
+    )
+
+
 def download_video(url: str, job_dir: str, log: DiagnosticLog, video_quality: str = "best") -> str:
     video_output_path = os.path.join(job_dir, "raw_video.mp4")
     if "drive.google.com" in url:
         download_from_gdrive(url, video_output_path, log)
     else:
-        fmt = _ytdlp_format(video_quality)
-        log.log(f"[Step 1] Downloading video via yt-dlp...  (quality={video_quality}, format={fmt})")
-        command = [
-            "yt-dlp",
-            "--cookies", "cookies.txt",
-            "-f", fmt,
-            "--merge-output-format", "mp4",
-            "-o", video_output_path,
-            url,
-        ]
-        result = subprocess.run(command, capture_output=True, text=True)
-        if result.returncode != 0:
-            log.error(f"yt-dlp failed:\nSTDOUT: {result.stdout}\nSTDERR: {result.stderr}")
-            raise RuntimeError("yt-dlp download failed")
-        log.log(f"         Video saved to: {video_output_path}")
+        _download_with_ytdlp(url, video_output_path, log, video_quality)
     return video_output_path
 
 
@@ -143,115 +217,34 @@ def extract_audio(video_path: str, output_path: str, log: DiagnosticLog) -> str:
     # 16 kHz mono is the native sample rate every ASR engine (Whisper/Deepgram)
     # resamples to anyway — extracting at 16 kHz makes a much smaller file, so the
     # ffmpeg encode is faster AND the upload to the transcription API is far quicker.
-    command = [
-        "ffmpeg", "-y",
-        "-i", video_path,
-        "-vn", "-ar", "16000", "-ac", "1", "-b:a", "32k", "-f", "mp3",
-        output_path,
+    #
+    # Fallback ladder: the compact 16 kHz encode fails on some odd source streams
+    # (broken timestamps, exotic codecs), so we retry with progressively more
+    # forgiving settings rather than losing the job.
+    attempts = [
+        ("16kHz mono mp3", ["-vn", "-ar", "16000", "-ac", "1", "-b:a", "32k", "-f", "mp3"]),
+        ("44.1kHz mono mp3", ["-vn", "-ar", "44100", "-ac", "1", "-b:a", "64k", "-f", "mp3"]),
+        ("stream copy -> mp3", ["-vn", "-acodec", "libmp3lame", "-q:a", "5", "-f", "mp3"]),
     ]
-    result = subprocess.run(command, capture_output=True, text=True)
-    log.log(f"        FFmpeg return code: {result.returncode}")
-    if result.returncode != 0:
-        log.error(f"FFmpeg audio extraction failed:\n{result.stderr}")
-        raise RuntimeError(f"FFmpeg audio extraction failed:\n{result.stderr}")
-    log.log(f"        Audio saved: {output_path}  ({os.path.getsize(output_path)} bytes)")
-    return output_path
+
+    last_err = ""
+    for name, args in attempts:
+        command = ["ffmpeg", "-y", "-err_detect", "ignore_err", "-i", video_path] + args + [output_path]
+        result = providers.run_cmd(command, timeout=1800, retries=1, log=log, label="ffmpeg-audio")
+        if result.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
+            log.log(f"        Audio saved via '{name}': {output_path} "
+                    f"({os.path.getsize(output_path)} bytes)")
+            return output_path
+        last_err = (result.stderr or "")[-800:]
+        log.log(f"        audio strategy '{name}' failed -> trying next")
+
+    log.error(f"FFmpeg audio extraction failed after all strategies:\n{last_err}")
+    raise RuntimeError(f"FFmpeg audio extraction failed:\n{last_err}")
 
 
 # ─────────────────────────────────────────────────────────────
 # Full-video transcription (used ONLY for highlight selection)
 # ─────────────────────────────────────────────────────────────
-
-def transcribe_full_video_deepgram(audio_path: str, job_dir: str, log: DiagnosticLog) -> str:
-    """Calls Deepgram nova-3 on the FULL VIDEO audio once and saves the result as
-    transcript_deepgram.json. The burn stage slices this for each clip's subtitles,
-    so we only pay for one Deepgram call regardless of how many clips are produced."""
-    from deepgram import DeepgramClient
-    log.log("[Step 3b] Transcribing full video with Deepgram nova-3 (for subtitle slicing)...")
-    api_key = os.environ.get("DEEPGRAM_API_KEY")
-    if not api_key:
-        log.log("  DEEPGRAM_API_KEY missing — subtitle stage will fall back to per-clip Deepgram calls")
-        return None
-
-    client = DeepgramClient()
-    with open(audio_path, "rb") as f:
-        buf = f.read()
-
-    try:
-        response = client.listen.v1.media.transcribe_file(
-            request=buf,
-            model="nova-3",
-            language="hi",
-            smart_format=True,
-            utterances=True,
-        )
-        if hasattr(response, "to_dict"):
-            data = response.to_dict()
-        elif hasattr(response, "model_dump"):
-            data = response.model_dump()
-        else:
-            data = json.loads(response.json())
-
-        # Map Deepgram utterances -> standard segments format (same as burn_subtitles._deepgram_transcribe)
-        whisper_format = {"segments": []}
-        utterances = data.get("results", {}).get("utterances", [])
-        for u in utterances:
-            seg = {
-                "start": u.get("start"), "end": u.get("end"),
-                "text": u.get("transcript"), "words": [],
-            }
-            for w in u.get("words", []):
-                seg["words"].append({
-                    "word":  w.get("punctuated_word", w.get("word")),
-                    "start": w.get("start"), "end": w.get("end"),
-                })
-            whisper_format["segments"].append(seg)
-
-        out_path = os.path.join(job_dir, "transcript_deepgram.json")
-        with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(whisper_format, f, indent=2, ensure_ascii=False)
-        log.log(f"  Deepgram full-video transcript saved: {out_path} "
-                f"({len(whisper_format['segments'])} segments)")
-        return out_path
-    except Exception as e:
-        log.error(f"Deepgram full-video transcription failed: {e}", e)
-        return None
-
-
-def _groq_transcribe_with_retry(client, audio_bytes: bytes, filename: str, log: DiagnosticLog):
-    """Call Groq Whisper with retries and model fallback.
-
-    Groq occasionally returns transient 500s and the full 'large-v3' model is more
-    prone to them than 'turbo'. We try each model a few times with exponential
-    backoff before moving to the next, so one hiccup doesn't kill the whole job."""
-    import time
-    models = ["whisper-large-v3", "whisper-large-v3-turbo"]
-    last_err = None
-    for model in models:
-        for attempt in range(1, 4):  # 3 attempts per model
-            try:
-                log.log(f"  Groq transcription: model={model}, attempt {attempt}/3")
-                return client.audio.transcriptions.create(
-                    file=(filename, audio_bytes),
-                    model=model,
-                    response_format="verbose_json",
-                    language="hi",
-                    timestamp_granularities=["word", "segment"],
-                )
-            except Exception as e:
-                last_err = e
-                status = getattr(e, "status_code", None)
-                # Don't waste retries on auth/permission/bad-request errors.
-                if status in (400, 401, 403, 404):
-                    log.log(f"  Non-retryable error ({status}) on {model}: {e}")
-                    break
-                wait = 2 ** attempt  # 2s, 4s, 8s
-                log.log(f"  Transcription error on {model} (attempt {attempt}): {e} — retrying in {wait}s")
-                time.sleep(wait)
-        log.log(f"  Model {model} exhausted; falling back to next model if available.")
-    # All models/attempts failed
-    raise last_err if last_err else RuntimeError("Groq transcription failed with no error captured")
-
 
 def transcribe_full_video(audio_path: str, job_dir: str, log: DiagnosticLog) -> str:
     """Transcribe the full video for AI highlight selection AND subtitle slicing.
@@ -503,6 +496,33 @@ WHAT MAKES A CLIP WORK:
 
 Each clip must be 20-40 seconds and start at the beginning of a sentence."""
 
+# Cap the user's brief so a pasted essay can't crowd the transcript out of the
+# context window (the transcript is what the model actually has to reason over).
+_MAX_CLIP_PROMPT_CHARS = 1200
+
+
+def _clip_prompt_block(clip_prompt: str) -> str:
+    """Render the user's free-text brief as the highest-priority instruction block.
+
+    Returned empty when no brief was given, so the default behaviour is unchanged."""
+    brief = (clip_prompt or "").strip()
+    if not brief:
+        return ""
+    if len(brief) > _MAX_CLIP_PROMPT_CHARS:
+        brief = brief[:_MAX_CLIP_PROMPT_CHARS].rstrip() + "…"
+    return f"""
+
+╔══ THE USER'S BRIEF — THIS OVERRIDES EVERYTHING ABOVE ══╗
+{brief}
+╚════════════════════════════════════════════════════════╝
+
+HOW TO APPLY THE BRIEF:
+- Only return moments that genuinely match the brief. Relevance to it beats raw virality.
+- Score by how well the moment fits the brief (10 = perfect match, 1 = unrelated).
+- In "reason", state explicitly how the moment matches the brief.
+- If NOTHING in this transcript portion matches the brief, return an empty list:
+  {{"highlights": []}} — do NOT pad with unrelated moments."""
+
 
 def _chunk_segments(segments: list, budget_chars: int) -> list:
     """Split segments into consecutive groups whose combined text stays under
@@ -539,29 +559,35 @@ def _call_selection_llm(client, prompt: str, log: DiagnosticLog):
 
 
 def select_highlights_chunked(segments: list, num_clips: int, per_chunk: int,
-                              log: DiagnosticLog) -> list:
+                              log: DiagnosticLog, clip_prompt: str = "") -> list:
     """Run the LLM selector across transcript chunks and merge the picks.
+
+    `clip_prompt` is the user's free-text description of the clips they want; when
+    present it is injected as the top-priority instruction and the model is told to
+    return nothing rather than pad with off-brief moments.
     Returns a list of raw {start, end, score, reason} (un-snapped)."""
-    have_any_llm = bool(os.environ.get("GROQ_API_KEY") or os.environ.get("GEMINI_API_KEY")
-                        or os.environ.get("GOOGLE_API_KEY"))
-    if not have_any_llm or not segments:
+    status = providers.provider_status()
+    if not status["chat_ready"] or not segments:
         return []
 
     client = None  # providers.chat manages its own clients/fallback
     chunks = _chunk_segments(segments, SELECTION_CHUNK_CHARS)
+    brief = _clip_prompt_block(clip_prompt)
     log.log(f"  AI selection: {len(segments)} segments -> {len(chunks)} chunk(s) "
             f"(model={SELECTION_MODEL_PRIMARY}, ~{SELECTION_CHUNK_CHARS} chars/chunk, "
             f"{per_chunk} picks/chunk)")
+    if brief:
+        log.log(f"  User brief active: {clip_prompt.strip()[:200]}")
 
     all_picks = []
     for ci, chunk in enumerate(chunks):
         chunk_text = "".join(f"[{s['start']:.2f} - {s['end']:.2f}] {s['text']}\n" for s in chunk)
-        prompt = f"""{_SELECTION_PROMPT_HEADER}
+        prompt = f"""{_SELECTION_PROMPT_HEADER}{brief}
 
 TASK:
-From the transcript portion below, return the {per_chunk} strongest clip(s). Use the EXACT
-timestamps shown (in seconds). Score each 1-10 (10 = most viral). For "reason", briefly note
-the hook and the payoff.
+From the transcript portion below, return up to {per_chunk} of the strongest clip(s). Use the
+EXACT timestamps shown (in seconds). Score each 1-10. For "reason", briefly note the hook and
+the payoff.
 
 Output ONLY valid JSON: {{"highlights": [{{"start": float, "end": float, "score": int, "reason": "string"}}]}}
 
@@ -572,6 +598,53 @@ TRANSCRIPT PORTION:
         all_picks.extend(picks)
 
     return all_picks
+
+
+# ─────────────────────────────────────────────────────────────
+# Last-resort highlights: no transcript at all
+# ─────────────────────────────────────────────────────────────
+
+def probe_duration(path: str, log: DiagnosticLog) -> float:
+    """Video duration in seconds via ffprobe, or 0.0 if it can't be determined."""
+    r = providers.run_cmd(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", path],
+        timeout=60, retries=2, log=log, label="ffprobe")
+    try:
+        return float((r.stdout or "").strip())
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def time_based_highlights(duration: float, num_clips: int,
+                          min_len: float, max_len: float, log: DiagnosticLog) -> list:
+    """Evenly spaced clips cut purely on the clock, used when NO transcript exists
+    (every ASR provider failed). Sentence-boundary snapping is impossible without
+    text, so this trades clean cuts for still shipping usable clips."""
+    if duration <= 0:
+        return []
+    length = max(min_len, min(max_len, (min_len + max_len) / 2.0))
+    # Skip the first/last 2% (intros and outros are rarely the good part).
+    usable_start = duration * 0.02
+    usable_end = max(usable_start + length, duration * 0.98)
+    span = usable_end - usable_start
+
+    fit = max(1, int(span // length))
+    n = max(1, min(num_clips, fit))
+    step = span / n
+
+    out = []
+    for i in range(n):
+        s = usable_start + i * step
+        e = min(s + length, duration)
+        if e - s < min_len * 0.6:
+            continue
+        out.append({
+            "start": round(s, 3), "end": round(e, 3), "score": 5,
+            "reason": f"Time-based clip {i + 1} (no transcript available)",
+        })
+    log.log(f"  Fallback: generated {len(out)} time-based clip(s) across {duration:.0f}s")
+    return out
 
 
 # ─────────────────────────────────────────────────────────────
@@ -655,7 +728,9 @@ def get_ai_highlights(transcript_path: str, job_dir: str, log: DiagnosticLog,
     # Run the modular, chunked LLM selector and turn its picks into validated clips.
     per_chunk = max(2, math.ceil(num_clips / max(1, math.ceil(
         (len(segments) and sum(len(s.get('text','')) for s in segments) or 1) / SELECTION_CHUNK_CHARS))))
-    raw_picks = select_highlights_chunked(segments, num_clips, per_chunk, log)
+    clip_prompt = str(options.get("clip_prompt", "") or "").strip()
+    raw_picks = select_highlights_chunked(segments, num_clips, per_chunk, log,
+                                          clip_prompt=clip_prompt)
 
     for h in raw_picks:
         try:
@@ -677,11 +752,21 @@ def get_ai_highlights(transcript_path: str, job_dir: str, log: DiagnosticLog,
     # Fill out to the requested count with coverage clips. These may overlap the
     # AI picks and each other, but each is distinct in start point, length, and/or
     # ending (never identical), and always cut on sentence boundaries.
+    #
+    # When the user gave a brief, generic coverage clips would defeat it — the point
+    # is clips ABOUT something. So we only fall back to coverage if the brief matched
+    # nothing at all, which beats handing back an empty result.
     if len(valid) < num_clips and segments:
-        needed = num_clips - len(valid)
-        coverage = _generate_dense_clips(segments, needed, valid, log, min_len, max_len)
-        log.log(f"\n  Coverage fill: requested {needed} more, generated {len(coverage)}")
-        valid.extend(coverage)
+        if clip_prompt and valid:
+            log.log(f"\n  Brief active: keeping the {len(valid)} matching clip(s) only "
+                    f"(not padding to {num_clips} with unrelated coverage clips).")
+        else:
+            if clip_prompt:
+                log.log("\n  Brief matched nothing — falling back to general coverage clips.")
+            needed = num_clips - len(valid)
+            coverage = _generate_dense_clips(segments, needed, valid, log, min_len, max_len)
+            log.log(f"  Coverage fill: requested {needed} more, generated {len(coverage)}")
+            valid.extend(coverage)
 
     valid = sorted(valid, key=lambda v: v.get("score", 0), reverse=True)[:num_clips]
     log.log(f"\n  Final clip selection ({len(valid)} clips), sorted by predicted performance:")
@@ -796,7 +881,8 @@ def execute_selection_workflow(
     pick up subtitle generation + burning from here.
     """
     job_id  = str(uuid.uuid4())
-    job_dir = os.path.join("output", job_id)
+    # Absolute so the pipeline works regardless of the server's working directory.
+    job_dir = os.path.join(BASE_DIR, "output", job_id)
     os.makedirs(job_dir, exist_ok=True)
 
     log = DiagnosticLog(job_dir)
@@ -811,6 +897,8 @@ def execute_selection_workflow(
     options.setdefault("num_clips", 3)
     # Clip selection mode: "multi" (~1 clip/min, 20-40s) or "best" (~n/2 clips, 40-60s).
     options.setdefault("clip_mode", "multi")
+    # Free-text brief describing the clips the user wants ('' = no brief, pick generally).
+    options.setdefault("clip_prompt", "")
     # Clip-length bounds (used by "multi" mode; "best" mode pins 40-60s internally).
     options.setdefault("min_clip_len", DEFAULT_MIN_CLIP_LEN)
     options.setdefault("max_clip_len", DEFAULT_MAX_CLIP_LEN)
@@ -853,11 +941,39 @@ def execute_selection_workflow(
         # duration. Deepgram runs later, per selected clip only (much cheaper here).
         if status_callback: status_callback("Step 3/4: Transcribing full video (Whisper)...")
         log.section("STEP 3 - FULL TRANSCRIPTION")
-        transcript_path = transcribe_full_video(full_audio_path, job_dir, log)
+        transcript_path = None
+        try:
+            transcript_path = transcribe_full_video(full_audio_path, job_dir, log)
+        except Exception as e:
+            log.error(f"Transcription unavailable: {e}", e)
 
         # ── STAGE 3: AI clip selection (chunked LLM; no video cutting here) ──
         if status_callback: status_callback("Step 4/4: AI is finding the most engaging moments...")
-        _, highlights = get_ai_highlights(transcript_path, job_dir, log, options)
+        if transcript_path:
+            _, highlights = get_ai_highlights(transcript_path, job_dir, log, options)
+        else:
+            # LAST RESORT: every ASR provider failed. Rather than returning nothing,
+            # cut evenly spaced clips off the clock. Captions are force-disabled for
+            # this job since there is no text to render.
+            log.section("FALLBACK - TIME-BASED SELECTION (no transcript)")
+            log.log("   All transcription providers failed. Cutting time-based clips and "
+                    "disabling captions for this job.")
+            if status_callback:
+                status_callback("Transcription unavailable — cutting time-based clips...")
+            duration = probe_duration(video_path, log)
+            minutes = max(1, round(duration / 60.0)) if duration else 1
+            raw_nc = options.get("num_clips", "auto")
+            try:
+                want = int(raw_nc)
+            except (TypeError, ValueError):
+                want = minutes   # "auto" and any unparseable value scale with length
+            highlights = time_based_highlights(
+                duration, min(want, _ABS_MAX_CLIPS),
+                float(options.get("min_clip_len", DEFAULT_MIN_CLIP_LEN)),
+                float(options.get("max_clip_len", DEFAULT_MAX_CLIP_LEN)), log)
+            options["burn_subtitles"] = False
+            with open(os.path.join(job_dir, "highlights.json"), "w", encoding="utf-8") as f:
+                json.dump(highlights, f, indent=4, ensure_ascii=False)
 
         # NOTE: We do NOT cut raw clips anymore. The burn stage seeks into the source
         # video directly (-ss/-to) and cuts + scales + burns in a single ffmpeg pass,
@@ -880,6 +996,8 @@ def execute_selection_workflow(
             "audio_path": full_audio_path,
             "transcript_path": transcript_path,
             "source_is_full_video": True,   # raw_path points at the full source
+            "clip_prompt": options.get("clip_prompt", ""),
+            "has_transcript": bool(transcript_path),
             # Caption/subtitle preferences chosen by the client, read by burn_subtitles.py.
             "subtitle_options": {
                 "burn_subtitles":    options.get("burn_subtitles", True),
