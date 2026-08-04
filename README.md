@@ -27,6 +27,24 @@ how to get them if they're missing.
 Then paste your **Groq API key** (free, 30 seconds) into the Setup panel that opens in
 your browser — and you're done. Nothing else to configure, no files to edit.
 
+### Opening it again later
+
+The installer adds a **ShortsAI** shortcut, so there's no command to remember:
+
+| | Where to find it |
+|---|---|
+| **Windows** | **Start Menu → ShortsAI**, or the ShortsAI icon on your Desktop |
+| **macOS** | `~/Applications → ShortsAI` (first time: right-click → Open) |
+| **Linux** | Your applications menu → **ShortsAI** |
+
+Click it and the app starts and opens your browser by itself. A small terminal window
+stays open while it runs — **closing that window stops ShortsAI.**
+
+Shortcut missing or the folder moved? Rebuild it:
+```bash
+python3 run.py --shortcut
+```
+
 ### Already have the repo?
 
 ```bash
@@ -44,6 +62,8 @@ That single command sets up anything missing and starts the app. Re-run it any t
 | `--setup-only` | Install everything but don't start |
 | `--reinstall` | Force-refresh the Python packages |
 | `--skip-fonts` | Skip font downloads on re-runs |
+| `--shortcut` | Rebuild the desktop / Start Menu shortcut and exit |
+| `--no-shortcut` | Don't create a shortcut |
 
 ---
 

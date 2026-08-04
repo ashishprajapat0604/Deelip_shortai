@@ -704,6 +704,197 @@ def readiness_summary():
         print()
         ok("All systems go — ready to process videos")
 
+# ── Desktop shortcut / app launcher ────────────────────────────────────────────
+# Goal: after the one-line install, ShortsAI opens like a normal app — from the
+# Start Menu on Windows, the applications menu on Linux, ~/Applications on macOS —
+# instead of the user having to remember a terminal command.
+#
+# Created once (tracked by SHORTCUT_STAMP) so deleting the shortcut on purpose
+# doesn't make it reappear on every launch. `--shortcut` forces a rebuild.
+
+ASSETS         = HERE / "assets"
+SHORTCUT_STAMP = VENV / ".shortcut"
+WIN_LAUNCHER   = HERE / "ShortsAI.bat"
+
+
+def _win_make_shortcut():
+    """Create Start Menu + Desktop .lnk files pointing at ShortsAI.bat.
+
+    Uses WScript.Shell via PowerShell — available on every Windows without extra
+    packages. Desktop/Start Menu paths come from GetFolderPath rather than being
+    built by hand, so OneDrive-redirected folders resolve correctly.
+    """
+    if not WIN_LAUNCHER.exists():
+        warn("ShortsAI.bat missing — cannot create a shortcut")
+        return False
+
+    icon = ASSETS / "shortsai.ico"
+    # A PowerShell here-string would need escaping for every path, so values are
+    # injected as variables with doubled single-quotes instead.
+    def ps_str(p):
+        return "'" + str(p).replace("'", "''") + "'"
+
+    script = f"""
+$ErrorActionPreference = 'Stop'
+$target  = {ps_str(WIN_LAUNCHER)}
+$workdir = {ps_str(HERE)}
+$icon    = {ps_str(icon)}
+$shell   = New-Object -ComObject WScript.Shell
+
+function New-ShortsAILink($path) {{
+    $lnk = $shell.CreateShortcut($path)
+    $lnk.TargetPath       = $target
+    $lnk.WorkingDirectory = $workdir
+    $lnk.Description      = 'ShortsAI - turn long videos into vertical Shorts'
+    # ",0" selects the first icon in the file; WScript.Shell expects path,index.
+    if (Test-Path $icon) {{ $lnk.IconLocation = "$icon,0" }}
+    $lnk.Save()
+    Write-Output $path
+}}
+
+$desktop = [Environment]::GetFolderPath('Desktop')
+$startup = Join-Path ([Environment]::GetFolderPath('StartMenu')) 'Programs'
+if (-not (Test-Path $startup)) {{ New-Item -ItemType Directory -Path $startup -Force | Out-Null }}
+
+New-ShortsAILink (Join-Path $desktop 'ShortsAI.lnk')
+New-ShortsAILink (Join-Path $startup 'ShortsAI.lnk')
+"""
+    ps1 = HERE / ".shortcut.ps1"
+    try:
+        # utf-8-sig: Windows PowerShell 5.1 decodes BOM-less .ps1 files as ANSI,
+        # which mangles any non-ASCII character in a path (e.g. a user folder
+        # like C:\Users\José). The BOM forces correct UTF-8 decoding.
+        ps1.write_text(script, encoding="utf-8-sig")
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(ps1)],
+            capture_output=True, text=True, timeout=60,
+        )
+        if result.returncode != 0:
+            warn(f"Could not create the Windows shortcut: "
+                 f"{(result.stderr or '').strip().splitlines()[-1] if result.stderr else 'unknown error'}")
+            return False
+        for line in (result.stdout or "").strip().splitlines():
+            ok(f"Shortcut created: {line.strip()}")
+        return True
+    except Exception as e:
+        warn(f"Could not create the Windows shortcut: {e}")
+        return False
+    finally:
+        try:
+            ps1.unlink()
+        except OSError:
+            pass
+
+
+def _linux_make_shortcut():
+    """Write a .desktop entry so ShortsAI shows up in the applications menu."""
+    apps = Path.home() / ".local" / "share" / "applications"
+    try:
+        apps.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        warn(f"Could not create {apps}: {e}")
+        return False
+
+    icon = ASSETS / "shortsai.png"
+    # Exec must be an absolute command; %-signs are reserved in .desktop files.
+    entry = (
+        "[Desktop Entry]\n"
+        "Type=Application\n"
+        "Name=ShortsAI\n"
+        "GenericName=Short-form video maker\n"
+        "Comment=Turn long videos into vertical Shorts with AI captions\n"
+        f"Exec={sys.executable} {HERE / 'run.py'}\n"
+        f"Path={HERE}\n"
+        f"Icon={icon if icon.exists() else 'video-x-generic'}\n"
+        "Terminal=true\n"
+        "Categories=AudioVideo;Video;\n"
+        "Keywords=video;shorts;reels;subtitles;captions;\n"
+    )
+    dest = apps / "shortsai.desktop"
+    try:
+        dest.write_text(entry, encoding="utf-8")
+        dest.chmod(0o755)
+    except OSError as e:
+        warn(f"Could not write {dest}: {e}")
+        return False
+
+    # Refresh the menu database when the tool is available (not on minimal WMs).
+    if have("update-desktop-database"):
+        try:
+            subprocess.run(["update-desktop-database", str(apps)],
+                           capture_output=True, timeout=20)
+        except Exception:
+            pass
+    ok(f"Shortcut created: {dest}")
+    return True
+
+
+def _mac_make_shortcut():
+    """Write a double-clickable .command into ~/Applications."""
+    apps = Path.home() / "Applications"
+    try:
+        apps.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        warn(f"Could not create {apps}: {e}")
+        return False
+
+    dest = apps / "ShortsAI.command"
+    script = (
+        "#!/bin/bash\n"
+        "# ShortsAI — double-click launcher (macOS)\n"
+        f'cd "{HERE}" || exit 1\n'
+        f'exec "{sys.executable}" run.py "$@"\n'
+    )
+    try:
+        dest.write_text(script, encoding="utf-8")
+        dest.chmod(0o755)
+    except OSError as e:
+        warn(f"Could not write {dest}: {e}")
+        return False
+    ok(f"Shortcut created: {dest}")
+    info("  (first double-click: right-click → Open, to clear Gatekeeper)")
+    return True
+
+
+def _reopen_hint(os_type):
+    """One line telling the user how to open ShortsAI again next time — the
+    shortcut if they have one, otherwise the command."""
+    if SHORTCUT_STAMP.exists():
+        if os_type == "windows":
+            return "Next time, open " + c("ShortsAI", "1") + " from the Start Menu or your Desktop."
+        if os_type == "mac":
+            return "Next time, double-click " + c("ShortsAI", "1") + " in ~/Applications."
+        if os_type == "linux":
+            return "Next time, open " + c("ShortsAI", "1") + " from your applications menu."
+    return "Start any time with:  " + c(f"cd {HERE} && python3 run.py", "1")
+
+
+def ensure_shortcut(os_type, force=False, skip=False):
+    """Create the desktop/menu launcher once. Never fatal — a failed shortcut
+    must not stop the app from starting."""
+    if skip:
+        return
+    if SHORTCUT_STAMP.exists() and not force:
+        return
+    try:
+        if os_type == "windows":
+            created = _win_make_shortcut()
+        elif os_type == "mac":
+            created = _mac_make_shortcut()
+        elif os_type == "linux":
+            created = _linux_make_shortcut()
+        else:
+            # WSL has no desktop of its own — the app is reached from the Windows browser.
+            return
+        if created:
+            try:
+                SHORTCUT_STAMP.write_text("ok\n")
+            except OSError:
+                pass
+    except Exception as e:
+        warn(f"Shortcut creation skipped: {e}")
+
+
 # ── Launch ─────────────────────────────────────────────────────────────────────
 def _port_is_free(host, port):
     import socket
@@ -785,6 +976,8 @@ def launch(host, port, reload_, open_browser=True):
     if open_browser:
         info("Opening your browser…")
         open_browser_when_up(target, port, host)
+    if SHORTCUT_STAMP.exists():
+        info(_reopen_hint(detect_os()[0]))
     info("Press Ctrl+C to stop.\n")
     try:
         subprocess.run(cmd)
@@ -820,6 +1013,10 @@ def main():
                     help="Skip API key and subtitle engine self-tests")
     ap.add_argument("--no-browser",     action="store_true",
                     help="Do not open the web UI in a browser on start")
+    ap.add_argument("--shortcut",       action="store_true",
+                    help="(Re)create the desktop / Start Menu shortcut and exit")
+    ap.add_argument("--no-shortcut",    action="store_true",
+                    help="Do not create a desktop / Start Menu shortcut")
     args = ap.parse_args()
 
     os.chdir(HERE)
@@ -828,6 +1025,12 @@ def main():
 
     label = f"{os_type}" + (f" / {distro}" if distro else "")
     print(c("\n  ShortsAI launcher", "1") + c(f"  ({label})\n", "90"))
+
+    # Standalone shortcut repair — no setup, no server.
+    if args.shortcut:
+        hdr("Desktop shortcut")
+        ensure_shortcut(os_type, force=True)
+        return
 
     hdr("Python")
     check_python()
@@ -849,6 +1052,7 @@ def main():
     hdr("App files")
     ensure_templates()
     ensure_env()
+    ensure_shortcut(os_type, skip=args.no_shortcut)
 
     readiness_summary()
 
@@ -857,7 +1061,7 @@ def main():
 
     if args.setup_only:
         print()
-        ok("Setup complete.  Start any time:  " + c("python3 run.py", "1"))
+        ok("Setup complete.  " + _reopen_hint(os_type))
         return
 
     launch(args.host, args.port, args.reload, open_browser=not args.no_browser)
