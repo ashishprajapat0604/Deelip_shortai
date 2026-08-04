@@ -24,6 +24,10 @@ irm https://raw.githubusercontent.com/ashishprajapat0604/short_aiv2/version2/ins
 You only need **git** and **Python 3.10+** beforehand; the installer tells you exactly
 how to get them if they're missing.
 
+> **New to this?** [**GUIDE.md**](GUIDE.md) walks through it step by step for Windows,
+> Linux and macOS — including how to get the free API key and what to do when
+> something goes wrong.
+
 Then paste your **Groq API key** (free, 30 seconds) into the Setup panel that opens in
 your browser — and you're done. Nothing else to configure, no files to edit.
 
