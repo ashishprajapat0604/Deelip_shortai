@@ -241,6 +241,29 @@ instead of failing.
 Clips appear on the page one by one as they finish. Download them individually, or
 grab everything as a ZIP.
 
+### Cutting a video into Part 1, Part 2, Part 3…
+
+Instead of letting the AI pick highlights, you can split the **whole** video into
+equal pieces — the format people use for long stories told across many Shorts.
+
+1. In **What should the AI look for?**, choose **Sequential parts**
+2. Set **Length of each part** (30 seconds is the usual choice)
+3. Optionally add a **title on every part**, e.g. `Motivation Series`
+4. Click **Generate**
+
+You get `part_1.mp4`, `part_2.mp4`, `part_3.mp4`… where each one picks up exactly
+where the last ended. A 10-minute video at 30s gives 20 parts; a 1-hour video gives
+120.
+
+> Turn captions **off** for this mode and it's much faster — with nothing to
+> transcribe, ShortsAI only has to cut and re-encode.
+
+### Moving the captions, title and Part badge
+
+In the **Live preview**, drag any of them — the caption, the title, the "PART 1"
+badge — wherever you want on the frame. Where you drop it is exactly where it burns
+into the video. Press **Reset** to put everything back.
+
 > **The first video is the slow one.** A 10-minute video takes a few minutes on a
 > normal laptop. Your clips are saved in the `output` folder inside the ShortsAI
 > directory and stay there until you delete them.

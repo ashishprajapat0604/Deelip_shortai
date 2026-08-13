@@ -389,6 +389,11 @@ _ABS_MAX_CLIPS = 80          # hard safety ceiling on clips per video
 _AI_MAX = 8                  # how many "best" clips we ask the LLM for
 _DEDUP_TOL = 2.0             # clips within 2s start AND 2s end are "identical"
 
+# Sequential ("Part 1, Part 2, …") mode splits the WHOLE video, so it needs a much
+# higher ceiling than highlight mode: a 1-hour video at 30s per part is 120 clips.
+_ABS_MAX_PARTS = 500
+DEFAULT_CHUNK_LEN = 30.0     # seconds per part when the caller doesn't say
+
 
 def _length_cycle(min_dur: float, max_dur: float) -> list:
     """Build a small set of varied target lengths that all sit inside
@@ -645,6 +650,76 @@ def time_based_highlights(duration: float, num_clips: int,
         })
     log.log(f"  Fallback: generated {len(out)} time-based clip(s) across {duration:.0f}s")
     return out
+
+
+# ─────────────────────────────────────────────────────────────
+# Sequential "Part 1 / Part 2 / Part 3" splitting
+# ─────────────────────────────────────────────────────────────
+
+def sequential_parts(duration: float, chunk_len: float, log: DiagnosticLog,
+                     label_format: str = "Part {n}") -> list:
+    """Split the WHOLE video into back-to-back parts of `chunk_len` seconds.
+
+    Every part starts exactly where the previous one ended — 0-30, 30-60, 60-90 …
+    so playing them in order reproduces the original video with nothing missing
+    and nothing repeated. This is deliberately NOT sentence-snapped: the promise
+    here is gapless coverage, and nudging boundaries to sentences would either
+    overlap or drop audio between parts.
+
+    The trailing remainder becomes its own part when it is long enough to stand
+    alone (>= 1/3 of a chunk, min 5s); otherwise it is merged into the last part
+    so no footage is lost and no 2-second orphan clip is produced.
+    """
+    if duration <= 0:
+        log.log("  Sequential split: duration unknown — cannot split")
+        return []
+
+    chunk_len = max(3.0, float(chunk_len))
+    if chunk_len >= duration:
+        log.log(f"  Sequential split: part length ({chunk_len:.0f}s) >= video "
+                f"({duration:.0f}s) — emitting a single part")
+        bounds = [(0.0, duration)]
+    else:
+        bounds = []
+        n_full = int(duration // chunk_len)
+        for i in range(n_full):
+            bounds.append((i * chunk_len, (i + 1) * chunk_len))
+
+        tail = duration - n_full * chunk_len
+        min_tail = max(5.0, chunk_len / 3.0)
+        if tail >= min_tail:
+            bounds.append((n_full * chunk_len, duration))
+        elif tail > 0.25 and bounds:
+            # Too short to be its own part — absorb it into the final one.
+            s, _e = bounds[-1]
+            bounds[-1] = (s, duration)
+            log.log(f"  Sequential split: {tail:.1f}s tail merged into the last part")
+
+    if len(bounds) > _ABS_MAX_PARTS:
+        log.log(f"  WARNING: {len(bounds)} parts exceeds the {_ABS_MAX_PARTS} ceiling — "
+                f"keeping the first {_ABS_MAX_PARTS}. Use a longer part length for full coverage.")
+        bounds = bounds[:_ABS_MAX_PARTS]
+
+    parts = []
+    for i, (s, e) in enumerate(bounds):
+        n = i + 1
+        try:
+            label = label_format.format(n=n, total=len(bounds))
+        except (KeyError, IndexError, ValueError):
+            label = f"Part {n}"
+        parts.append({
+            "start": round(s, 3),
+            "end": round(e, 3),
+            "score": 10,                # order is meaningful here, not "quality"
+            "part": n,
+            "part_label": label,
+            "reason": label,
+        })
+
+    total = sum(p["end"] - p["start"] for p in parts)
+    log.log(f"  Sequential split: {len(parts)} part(s) of ~{chunk_len:.0f}s "
+            f"covering {total:.0f}s of {duration:.0f}s")
+    return parts
 
 
 # ─────────────────────────────────────────────────────────────
@@ -914,6 +989,15 @@ def execute_selection_workflow(
     options.setdefault("english_font", "")                  # poppins|anton|bebas|archivo|fjalla ('' = auto)
     options.setdefault("video_quality", "best")             # best|1080|720|480|360 (link downloads)
     options.setdefault("show_title", False)
+    # Sequential ("Part 1, Part 2, …") mode.
+    options.setdefault("chunk_len", DEFAULT_CHUNK_LEN)      # seconds per part
+    options.setdefault("part_label_format", "Part {n}")     # {n} = number, {total} = count
+    options.setdefault("series_title", "")                  # fixed title burned on every part
+    options.setdefault("show_part_label", True)
+    # Free placement for the three overlays; None = use the preset position.
+    options.setdefault("caption_xy", None)
+    options.setdefault("title_xy", None)
+    options.setdefault("part_xy", None)
     log.log(f"   Options  : {options}")
 
     raw_clips = []
@@ -932,48 +1016,97 @@ def execute_selection_workflow(
             log.section("STEP 1 - VIDEO DOWNLOAD")
             video_path = download_video(url, job_dir, log, options.get("video_quality", "best"))
 
-        if status_callback: status_callback("Step 2/4: Extracting audio...")
-        log.section("STEP 2 - AUDIO EXTRACTION")
-        full_audio_path = extract_audio(video_path, os.path.join(job_dir, "audio.mp3"), log)
-
-        # ── STAGE 2: ONE Whisper transcription of the full video (for selection only).
-        # We deliberately do NOT run Deepgram on the whole video — that bills the full
-        # duration. Deepgram runs later, per selected clip only (much cheaper here).
-        if status_callback: status_callback("Step 3/4: Transcribing full video (Whisper)...")
-        log.section("STEP 3 - FULL TRANSCRIPTION")
+        # ── SEQUENTIAL MODE ──────────────────────────────────────────────────
+        # Splitting the whole video into Part 1 / Part 2 / Part 3 needs no AI and
+        # no transcript — only the duration. Transcription runs ONLY when captions
+        # are switched on, which makes a captionless 1-hour split near-instant.
+        sequential = str(options.get("clip_mode", "multi")).lower() == "sequential"
+        full_audio_path = None
         transcript_path = None
-        try:
-            transcript_path = transcribe_full_video(full_audio_path, job_dir, log)
-        except Exception as e:
-            log.error(f"Transcription unavailable: {e}", e)
 
-        # ── STAGE 3: AI clip selection (chunked LLM; no video cutting here) ──
-        if status_callback: status_callback("Step 4/4: AI is finding the most engaging moments...")
-        if transcript_path:
-            _, highlights = get_ai_highlights(transcript_path, job_dir, log, options)
-        else:
-            # LAST RESORT: every ASR provider failed. Rather than returning nothing,
-            # cut evenly spaced clips off the clock. Captions are force-disabled for
-            # this job since there is no text to render.
-            log.section("FALLBACK - TIME-BASED SELECTION (no transcript)")
-            log.log("   All transcription providers failed. Cutting time-based clips and "
-                    "disabling captions for this job.")
-            if status_callback:
-                status_callback("Transcription unavailable — cutting time-based clips...")
+        if sequential:
+            log.section("STEP 2 - SEQUENTIAL SPLIT")
+            if status_callback: status_callback("Step 2/4: Measuring video length...")
             duration = probe_duration(video_path, log)
-            minutes = max(1, round(duration / 60.0)) if duration else 1
-            raw_nc = options.get("num_clips", "auto")
+            chunk_len = options.get("chunk_len", DEFAULT_CHUNK_LEN)
             try:
-                want = int(raw_nc)
+                chunk_len = float(chunk_len)
             except (TypeError, ValueError):
-                want = minutes   # "auto" and any unparseable value scale with length
-            highlights = time_based_highlights(
-                duration, min(want, _ABS_MAX_CLIPS),
-                float(options.get("min_clip_len", DEFAULT_MIN_CLIP_LEN)),
-                float(options.get("max_clip_len", DEFAULT_MAX_CLIP_LEN)), log)
-            options["burn_subtitles"] = False
+                chunk_len = DEFAULT_CHUNK_LEN
+            log.log(f"   Video duration : {duration:.1f}s")
+            log.log(f"   Part length    : {chunk_len:.0f}s")
+            highlights = sequential_parts(
+                duration, chunk_len, log,
+                label_format=str(options.get("part_label_format") or "Part {n}"))
+            if not highlights:
+                raise RuntimeError(
+                    "Could not split the video: its duration could not be read. "
+                    "The file may be corrupt or still downloading.")
             with open(os.path.join(job_dir, "highlights.json"), "w", encoding="utf-8") as f:
                 json.dump(highlights, f, indent=4, ensure_ascii=False)
+
+            if options.get("burn_subtitles", True):
+                if status_callback: status_callback("Step 3/4: Extracting audio...")
+                log.section("STEP 3 - AUDIO + TRANSCRIPTION (for captions)")
+                full_audio_path = extract_audio(
+                    video_path, os.path.join(job_dir, "audio.mp3"), log)
+                try:
+                    transcript_path = transcribe_full_video(full_audio_path, job_dir, log)
+                except Exception as e:
+                    log.error(f"Transcription unavailable: {e}", e)
+                    log.log("   Captions disabled for this job — parts will still be cut.")
+                    options["burn_subtitles"] = False
+            else:
+                log.log("   Captions are OFF — skipping audio extraction and transcription "
+                        "entirely (nothing to transcribe).")
+                if status_callback:
+                    status_callback("Captions off — cutting parts directly...")
+
+        else:
+            if status_callback: status_callback("Step 2/4: Extracting audio...")
+            log.section("STEP 2 - AUDIO EXTRACTION")
+            full_audio_path = extract_audio(video_path, os.path.join(job_dir, "audio.mp3"), log)
+
+            # ── STAGE 2: ONE Whisper transcription of the full video (for selection only).
+            # We deliberately do NOT run Deepgram on the whole video — that bills the full
+            # duration. Deepgram runs later, per selected clip only (much cheaper here).
+            if status_callback: status_callback("Step 3/4: Transcribing full video (Whisper)...")
+            log.section("STEP 3 - FULL TRANSCRIPTION")
+            try:
+                transcript_path = transcribe_full_video(full_audio_path, job_dir, log)
+            except Exception as e:
+                log.error(f"Transcription unavailable: {e}", e)
+
+        # ── STAGE 3: AI clip selection (chunked LLM; no video cutting here) ──
+        # Sequential mode already decided its parts above and skips this entirely.
+        if not sequential:
+            if status_callback:
+                status_callback("Step 4/4: AI is finding the most engaging moments...")
+            if transcript_path:
+                _, highlights = get_ai_highlights(transcript_path, job_dir, log, options)
+            else:
+                # LAST RESORT: every ASR provider failed. Rather than returning nothing,
+                # cut evenly spaced clips off the clock. Captions are force-disabled for
+                # this job since there is no text to render.
+                log.section("FALLBACK - TIME-BASED SELECTION (no transcript)")
+                log.log("   All transcription providers failed. Cutting time-based clips and "
+                        "disabling captions for this job.")
+                if status_callback:
+                    status_callback("Transcription unavailable — cutting time-based clips...")
+                duration = probe_duration(video_path, log)
+                minutes = max(1, round(duration / 60.0)) if duration else 1
+                raw_nc = options.get("num_clips", "auto")
+                try:
+                    want = int(raw_nc)
+                except (TypeError, ValueError):
+                    want = minutes   # "auto" and any unparseable value scale with length
+                highlights = time_based_highlights(
+                    duration, min(want, _ABS_MAX_CLIPS),
+                    float(options.get("min_clip_len", DEFAULT_MIN_CLIP_LEN)),
+                    float(options.get("max_clip_len", DEFAULT_MAX_CLIP_LEN)), log)
+                options["burn_subtitles"] = False
+                with open(os.path.join(job_dir, "highlights.json"), "w", encoding="utf-8") as f:
+                    json.dump(highlights, f, indent=4, ensure_ascii=False)
 
         # NOTE: We do NOT cut raw clips anymore. The burn stage seeks into the source
         # video directly (-ss/-to) and cuts + scales + burns in a single ffmpeg pass,
@@ -985,6 +1118,10 @@ def execute_selection_workflow(
             "end": h["end"],
             "reason": h.get("reason", ""),
             "score": h.get("score", 0),
+            # Sequential mode only: the "Part 3" text and its ordinal. Absent for
+            # highlight clips, which have no meaningful running order.
+            "part": h.get("part"),
+            "part_label": h.get("part_label", ""),
         } for i, h in enumerate(highlights)]
         raw_clips = clip_entries
 
@@ -998,6 +1135,8 @@ def execute_selection_workflow(
             "source_is_full_video": True,   # raw_path points at the full source
             "clip_prompt": options.get("clip_prompt", ""),
             "has_transcript": bool(transcript_path),
+            "clip_mode": options.get("clip_mode", "multi"),
+            "sequential": sequential,
             # Caption/subtitle preferences chosen by the client, read by burn_subtitles.py.
             "subtitle_options": {
                 "burn_subtitles":    options.get("burn_subtitles", True),
@@ -1009,6 +1148,15 @@ def execute_selection_workflow(
                 "hindi_font":        options.get("hindi_font", ""),
                 "english_font":      options.get("english_font", ""),
                 "show_title":        options.get("show_title", False),
+                # Sequential extras: a fixed title shown on every part, and the
+                # "Part N" badge.
+                "series_title":      options.get("series_title", ""),
+                "show_part_label":   options.get("show_part_label", True),
+                # Free placement (drag & drop in the UI). Each is {"x":0..1,"y":0..1}
+                # in 9:16 frame fractions, or None to use the preset position.
+                "caption_xy":        options.get("caption_xy"),
+                "title_xy":          options.get("title_xy"),
+                "part_xy":           options.get("part_xy"),
             },
             "clips": clip_entries,
         }

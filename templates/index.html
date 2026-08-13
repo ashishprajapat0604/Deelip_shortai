@@ -253,6 +253,28 @@ body{margin:0; font-family:"Inter",system-ui,sans-serif; color:var(--ink); backg
   font-size:clamp(13px,3.6vw,16px); color:#ffce4a; text-transform:uppercase; letter-spacing:.02em;
   text-shadow:-1.5px -1.5px 0 #000,1.5px -1.5px 0 #000,-1.5px 1.5px 0 #000,1.5px 1.5px 0 #000; top:4%; transition:.25s}
 .cap-stage.title-bottom .cap-title{top:auto; bottom:4%}
+/* "Part 3" badge */
+.cap-part{position:absolute; left:7%; right:7%; z-index:3; text-align:center; font-weight:800;
+  font-size:clamp(13px,3.8vw,17px); color:#fff; text-transform:uppercase; letter-spacing:.04em;
+  text-shadow:-2px -2px 0 #000,2px -2px 0 #000,-2px 2px 0 #000,2px 2px 0 #000; top:3%; transition:.25s}
+.cap-stage.nocap .cap-part{display:block}
+/* ── Drag & drop placement ─────────────────────────────────────────────── */
+/* A dragged overlay is pinned by its CENTRE, matching the ASS \pos() anchor
+   the renderer uses, so what you see here is where it lands in the video. */
+.cap-stage[data-drag="1"] .cap-text,
+.cap-stage[data-drag="1"] .cap-title,
+.cap-stage[data-drag="1"] .cap-part{cursor:grab; touch-action:none}
+.cap-stage[data-drag="1"] .cap-text:hover,
+.cap-stage[data-drag="1"] .cap-title:hover,
+.cap-stage[data-drag="1"] .cap-part:hover{outline:2px dashed rgba(255,255,255,.85); outline-offset:5px; border-radius:6px}
+.drag-free{left:auto!important; right:auto!important; top:auto!important; bottom:auto!important;
+  transform:translate(-50%,-50%)!important; width:86%; }
+.dragging{cursor:grabbing!important; opacity:.92; outline:2px solid var(--accent,#ff5c7a)!important; outline-offset:5px; border-radius:6px}
+.drag-hint{display:flex; align-items:center; gap:7px; justify-content:center; margin-top:9px;
+  font-size:12px; color:var(--ink-faint); text-align:center}
+.drag-hint button{background:none; border:1px solid var(--hair-strong); color:var(--ink-faint);
+  border-radius:999px; padding:3px 10px; font:inherit; font-size:11px; cursor:pointer}
+.drag-hint button:hover{color:var(--ink); border-color:var(--ink-faint)}
 .cs-outline{color:#fff; text-shadow:-2px -2px 0 #000,2px -2px 0 #000,-2px 2px 0 #000,2px 2px 0 #000,0 3px 6px rgba(0,0,0,.6)}
 .cs-box{color:#fff; background:rgba(0,0,0,.62); padding:5px 11px; border-radius:3px; box-decoration-break:clone; -webkit-box-decoration-break:clone}
 .cs-white_box{color:#141414; background:rgba(255,255,255,.5); padding:5px 11px; border-radius:3px; box-decoration-break:clone; -webkit-box-decoration-break:clone}
@@ -427,6 +449,7 @@ body{margin:0; font-family:"Inter",system-ui,sans-serif; color:var(--ink); backg
   <div class="card">
     <div class="card-h"><div class="step-no">弐</div><h2>What should the AI look for?</h2></div>
 
+    <div id="briefField">
     <div class="brief-head">
       <span class="brief-lbl">Describe the clips you want</span>
       <span class="brief-opt">optional — leave blank to let the AI pick freely</span>
@@ -442,8 +465,9 @@ body{margin:0; font-family:"Inter",system-ui,sans-serif; color:var(--ink); backg
       <button type="button" class="chip" onclick="useBrief(this)">Emotional storytelling</button>
     </div>
     <div class="modeinfo" style="margin-bottom:16px"><span>🛈</span><span>When you write a brief, the AI returns only moments that match it — so you may get fewer clips than requested.</span></div>
+    </div><!-- /briefField -->
 
-    <div class="opt-grid">
+    <div class="opt-grid" id="momentTypes">
       <label class="opt on" id="tog-viral" onclick="toggleOpt(this)"><div class="toggle-box"></div><div><div class="ot">Viral moments</div><div class="oss">Hooks that stop the scroll</div></div></label>
       <label class="opt on" id="tog-emotional" onclick="toggleOpt(this)"><div class="toggle-box"></div><div><div class="ot">Emotional beats</div><div class="oss">Story &amp; feeling</div></div></label>
       <label class="opt on" id="tog-key" onclick="toggleOpt(this)"><div class="toggle-box"></div><div><div class="ot">Key insights</div><div class="oss">The most useful takeaways</div></div></label>
@@ -452,8 +476,30 @@ body{margin:0; font-family:"Inter",system-ui,sans-serif; color:var(--ink); backg
     <div class="opt-grid" style="margin-top:12px">
       <label class="opt on" id="mode-multi" onclick="setClipMode('multi')"><div class="toggle-box"></div><div><div class="ot">Multi-clip mode</div><div class="oss">More clips · ~1 per minute · 20–40s each</div></div></label>
       <label class="opt" id="mode-best" onclick="setClipMode('best')"><div class="toggle-box"></div><div><div class="ot">Best moments mode</div><div class="oss">Fewer, stronger · half as many · 40–60s each</div></div></label>
+      <label class="opt" id="mode-sequential" onclick="setClipMode('sequential')"><div class="toggle-box"></div><div><div class="ot">Sequential parts</div><div class="oss">Split the whole video · Part 1, Part 2, Part 3…</div></div></label>
     </div>
-    <div class="stepper">
+
+    <!-- Sequential-only controls -->
+    <div id="seqPanel" style="display:none">
+      <div class="stepper" style="margin-top:14px">
+        <span class="sl">Length of each part</span>
+        <div class="step-ctrl" id="partStepper">
+          <button id="partMinus" onclick="changePartLen(-1)">−</button>
+          <span class="cv" id="partLenVal">30s</span>
+          <button id="partPlus" onclick="changePartLen(1)">+</button>
+        </div>
+      </div>
+      <div class="cap-field" style="margin-top:12px">
+        <div class="cap-lbl">Title on every part <span style="opacity:.6;font-weight:400">— optional</span></div>
+        <input class="field" id="seriesTitle" type="text" maxlength="60"
+               placeholder="e.g. Motivation Series" oninput="renderPreview()">
+      </div>
+      <label class="mini-toggle on" id="partLabelToggle" onclick="togglePartLabel(this)" style="margin-top:10px">
+        <div class="toggle-box"></div><span>Show the “Part 1” badge on the video</span>
+      </label>
+      <div class="modeinfo" id="seqInfo" style="margin-top:12px"><span>🛈</span><span></span></div>
+    </div>
+    <div class="stepper" id="clipCountField">
       <span class="sl">Number of clips</span>
       <div class="step-ctrl" id="clipStepper" data-disabled="1">
         <button id="countMinus" onclick="changeCount(-1)" disabled>−</button>
@@ -577,11 +623,16 @@ body{margin:0; font-family:"Inter",system-ui,sans-serif; color:var(--ink); backg
             <path d="M30 64 L44 60 L52 74 Z" fill="#fff" opacity="0.7"/>
           </svg>
           <div class="lb t"></div><div class="lb b"></div>
+          <div class="cap-part" id="capPart" style="display:none">PART 1</div>
           <div class="cap-title" id="capTitle" style="display:none">DON'T MISS THIS</div>
           <div class="cap-text cs-outline" id="capText">This changes everything</div>
           <div class="cap-text cs-outline" id="capText2" style="display:none"></div>
         </div>
         <div class="preview-cap" id="previewCap">Exactly how your captions will look</div>
+        <div class="drag-hint" id="dragHint">
+          <span>✥ Drag the caption, title or part badge to place it</span>
+          <button type="button" id="resetPosBtn" onclick="resetPositions()" style="display:none">Reset</button>
+        </div>
       </div>
     </div>
   </div>
@@ -631,6 +682,12 @@ body{margin:0; font-family:"Inter",system-ui,sans-serif; color:var(--ink); backg
 // ── State ──
 let currentMode='online', currentJobId=null;
 let autoClips=true, clipCount=15, autoDelete=false, clipMode='multi';
+// Sequential ("Part 1, Part 2…") mode
+let partLen=30, showPartLabel=true;
+const PART_LENS=[10,15,20,30,45,60,90,120,180,300];
+// Free overlay placement. null = use the preset position; otherwise {x,y} as
+// fractions of the 9:16 frame, matching what the renderer's \pos() expects.
+let capXY=null, titleXY=null, partXY=null;
 let capBurn=true, capLayout='single', capLang='hindi', capPos='bottom', capStyle='outline', capAccent='#FFE600';
 let hindiFont='noto', englishFont='poppins';
 let videoQuality='best';
@@ -750,6 +807,79 @@ function updateLayoutFields(){
   document.getElementById('posField').style.display=single?'':'none';
 }
 
+// ── Drag & drop overlay placement ──────────────────────────────────────────
+// Each overlay can be dragged anywhere on the 9:16 stage. We store the CENTRE as
+// a fraction of the frame, which is exactly what the renderer's ASS \pos() takes,
+// so the preview and the burned video agree.
+const DRAG_TARGETS={capText:'caption', capTitle:'title', capPart:'part'};
+
+function _setXY(kind,xy){
+  if(kind==='caption') capXY=xy; else if(kind==='title') titleXY=xy; else partXY=xy;
+}
+function _getXY(kind){
+  return kind==='caption'?capXY:(kind==='title'?titleXY:partXY);
+}
+
+function applyFreePos(el,xy){
+  if(!el) return;
+  if(xy){
+    el.classList.add('drag-free');
+    el.style.left=(xy.x*100)+'%';
+    el.style.top =(xy.y*100)+'%';
+  } else {
+    el.classList.remove('drag-free');
+    el.style.left=''; el.style.top='';
+  }
+}
+
+function startDrag(ev){
+  const el=ev.currentTarget, kind=DRAG_TARGETS[el.id];
+  if(!kind) return;
+  const stage=document.getElementById('capStage');
+  if(stage.dataset.drag!=='1') return;
+  ev.preventDefault();
+  el.classList.add('dragging');
+  try{ el.setPointerCapture(ev.pointerId); }catch(_){}
+
+  const move=(e)=>{
+    const r=stage.getBoundingClientRect();
+    if(!r.width||!r.height) return;
+    // Clamp to the same safe band the renderer enforces, so a chip can't be
+    // dragged somewhere the burned text would be cut off.
+    const x=Math.min(0.98,Math.max(0.02,(e.clientX-r.left)/r.width));
+    const y=Math.min(0.98,Math.max(0.02,(e.clientY-r.top )/r.height));
+    _setXY(kind,{x:+x.toFixed(4),y:+y.toFixed(4)});
+    applyFreePos(el,_getXY(kind));
+    document.getElementById('resetPosBtn').style.display='';
+  };
+  const up=(e)=>{
+    el.classList.remove('dragging');
+    try{ el.releasePointerCapture(ev.pointerId); }catch(_){}
+    el.removeEventListener('pointermove',move);
+    el.removeEventListener('pointerup',up);
+    el.removeEventListener('pointercancel',up);
+    renderPreview();
+  };
+  el.addEventListener('pointermove',move);
+  el.addEventListener('pointerup',up);
+  el.addEventListener('pointercancel',up);
+}
+
+function initDrag(){
+  Object.keys(DRAG_TARGETS).forEach(id=>{
+    const el=document.getElementById(id);
+    if(el) el.addEventListener('pointerdown',startDrag);
+  });
+  document.getElementById('capStage').dataset.drag='1';
+}
+
+function resetPositions(){
+  capXY=titleXY=partXY=null;
+  ['capText','capText2','capTitle','capPart'].forEach(id=>applyFreePos(document.getElementById(id),null));
+  document.getElementById('resetPosBtn').style.display='none';
+  renderPreview();
+}
+
 // ── Live caption preview (the signature) ──
 const SAMPLE={ hindi:'यही बात सब बदल देती है', english:'This changes everything', hinglish:'Yahi baat sab badal deti hai' };
 function renderPreview(){
@@ -764,12 +894,29 @@ function renderPreview(){
   const posClass = dual ? 'pos-bottom' : 'pos-'+capPos;
   stage.className='cap-stage '+posClass+(capBurn?'':' nocap')+(dual?' dual':'');
 
-  // AI title sits opposite the captions
-  if(showTitle && capBurn){
+  // Title: the AI headline, or the fixed series title in sequential mode.
+  const seq=(clipMode==='sequential');
+  const seriesEl=document.getElementById('seriesTitle');
+  const seriesTxt=(seriesEl?seriesEl.value.trim():'');
+  const wantTitle=(showTitle||!!seriesTxt);
+  if(wantTitle && (capBurn||seq)){
     title.style.display='block';
+    title.textContent=(seriesTxt||"DON'T MISS THIS").toUpperCase();
     const capAtTop=(!dual && capPos==='top');
     stage.classList.toggle('title-bottom', capAtTop);
   } else { title.style.display='none'; }
+
+  // "Part 1" badge — sequential mode only, and independent of captions.
+  const partEl=document.getElementById('capPart');
+  if(partEl) partEl.style.display=(seq && showPartLabel)?'block':'none';
+
+  // Re-apply any dragged positions (classes above reset the presets).
+  applyFreePos(cap, capXY);
+  applyFreePos(cap2, capXY?{x:capXY.x,y:Math.min(0.98,capXY.y+0.055)}:null);
+  applyFreePos(title, titleXY);
+  applyFreePos(partEl, partXY);
+  const resetBtn=document.getElementById('resetPosBtn');
+  if(resetBtn) resetBtn.style.display=(capXY||titleXY||partXY)?'':'none';
 
   if(dual){
     cap.className='cap-text cs-outline';
@@ -797,11 +944,52 @@ function renderPreview(){
 
 // ── Clip mode (multi = many short clips · best = fewer longer highlights) ──
 function setClipMode(m){
-  clipMode=(m==='best')?'best':'multi';
+  clipMode=(m==='best'||m==='sequential')?m:'multi';
   document.getElementById('mode-multi').classList.toggle('on', clipMode==='multi');
   document.getElementById('mode-best').classList.toggle('on', clipMode==='best');
+  document.getElementById('mode-sequential').classList.toggle('on', clipMode==='sequential');
+  const seq=(clipMode==='sequential');
+
+  // Sequential splits the WHOLE video on the clock, so the AI-selection controls
+  // (brief, moment types, clip count) have nothing to act on — hide them.
+  document.getElementById('seqPanel').style.display = seq?'':'none';
+  ['briefField','clipCountField','momentTypes'].forEach(id=>{
+    const el=document.getElementById(id); if(el) el.style.display = seq?'none':'';
+  });
+
   const autoLbl=document.querySelector('#autoClipsToggle span');
   if(autoLbl) autoLbl.textContent = clipMode==='best' ? 'Auto (best ~1 per 2 min)' : 'Auto (1 per minute)';
+  updateSeqInfo();
+  renderPreview();
+}
+
+function changePartLen(dir){
+  let i=PART_LENS.indexOf(partLen);
+  if(i<0) i=PART_LENS.indexOf(30);
+  i=Math.max(0,Math.min(PART_LENS.length-1,i+dir));
+  partLen=PART_LENS[i];
+  document.getElementById('partLenVal').textContent = partLen>=60
+    ? (partLen%60===0 ? (partLen/60)+'m' : Math.floor(partLen/60)+'m '+(partLen%60)+'s')
+    : partLen+'s';
+  document.getElementById('partMinus').disabled = (i===0);
+  document.getElementById('partPlus').disabled  = (i===PART_LENS.length-1);
+  updateSeqInfo();
+}
+
+function togglePartLabel(el){
+  el.classList.toggle('on');
+  showPartLabel=el.classList.contains('on');
+  renderPreview();
+}
+
+// Show the user what their choice actually produces, before they commit to it.
+function updateSeqInfo(){
+  const box=document.getElementById('seqInfo'); if(!box) return;
+  const span=box.querySelector('span:last-child');
+  const ex=[1,2,3].map(n=>`Part ${n} (${(n-1)*partLen}–${n*partLen}s)`).join(' · ');
+  span.innerHTML=`Each part is <b>${partLen}s</b> and starts exactly where the last one ended: ${ex}…<br>`
+    + `A 10-minute video makes about <b>${Math.max(1,Math.round(600/partLen))} parts</b>; `
+    + `a 1-hour video about <b>${Math.max(1,Math.round(3600/partLen))}</b>.`;
 }
 
 // ── Clip count ──
@@ -831,6 +1019,12 @@ function getOptions(){
     trend:document.getElementById('tog-trend').classList.contains('on'),
     num_clips:autoClips?'auto':clipCount,
     clip_mode:clipMode,
+    // Sequential parts
+    chunk_len:partLen,
+    series_title:(document.getElementById('seriesTitle')||{value:''}).value.trim(),
+    show_part_label:showPartLabel,
+    // Drag & drop placement (null = keep the preset position)
+    caption_xy:capXY, title_xy:titleXY, part_xy:partXY,
     clip_prompt:(document.getElementById('clipPrompt')||{value:''}).value.trim(),
     min_clip_len:20, max_clip_len:40,
     burn_subtitles:capBurn,
@@ -1183,6 +1377,9 @@ document.addEventListener('keydown',e=>{ if(e.key==='Escape') closeSetup(); });
 // ── Init ──
 pickPos(capPos);
 updateFontFields();
+initDrag();
+changePartLen(0);      // paints the part-length label + stepper button states
+setClipMode(clipMode); // shows/hides the mode-specific panels
 renderPreview();
 updateBriefCount();
 refreshSetup();

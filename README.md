@@ -148,15 +148,49 @@ ollama pull llama3.1                # offline text/selection
 | Feature | Options | Default |
 |---|---|---|
 | Clip brief | free text — describe what you want | *(blank)* |
-| Clip mode | `multi` (~1/min, 20–40s) · `best` (fewer, 40–60s) | multi |
+| Clip mode | `multi` (~1/min, 20–40s) · `best` (fewer, 40–60s) · `sequential` (whole video → parts) | multi |
 | Number of clips | auto (1 per minute) or 5–60 | auto |
+| Part length *(sequential)* | 10s – 5min | 30s |
+| Series title *(sequential)* | free text, burned on every part | *(blank)* |
+| "Part 1" badge *(sequential)* | on / off | on |
 | Burn subtitles | on / off | on |
 | Layout | `single` · `dual` (Hindi ↑ / English ↓) | single |
 | Language | `hindi` · `english` · `hinglish` | hindi |
-| Position | `top` · `middle` · `bottom` · `below` | bottom |
+| Position | `top` · `middle` · `bottom` · `below`, or **drag anywhere** | bottom |
 | Caption look | outline · box · white_box · bold_yellow · karaoke · neon · retro · shadow · fire · fade | outline |
 | Fonts | 8 Devanagari · 10 Latin | Noto / Poppins |
 | AI title line | on / off | off |
+
+### Sequential parts mode
+
+Splits the **whole** video into back-to-back clips instead of hunting for highlights:
+
+```
+Part 1 = 0–30s   Part 2 = 30–60s   Part 3 = 60–90s   …
+```
+
+Every part begins exactly where the previous one ended, so playing them in order
+reproduces the original with nothing missing and nothing repeated. Files are named
+`part_1.mp4`, `part_2.mp4`, … and each can carry a **Part N** badge plus a fixed
+series title.
+
+A trailing remainder becomes its own part when it's at least a third of a full part
+(minimum 5s); anything shorter is absorbed into the last part, so you never get a
+2-second orphan clip.
+
+Unlike highlight mode, these cuts are **not** snapped to sentence boundaries — the
+promise is gapless coverage, and nudging a boundary would either overlap or drop
+audio between parts.
+
+With captions switched off this mode needs no transcription at all, so splitting a
+long video is near-instant and costs nothing in API calls.
+
+### Drag-and-drop placement
+
+In the live preview, drag the **caption**, **title** or **Part N** badge anywhere on
+the 9:16 frame. The position you see is where it burns in: the UI stores the centre
+point as a fraction of the frame and the renderer pins it there with the same
+coordinates. **Reset** returns everything to the preset positions.
 
 `english` = translation of the Hindi audio. `hinglish` = the Hindi romanised into Latin
 letters. Everything is previewed live in the page before you render.
@@ -210,6 +244,26 @@ Example `options` payload:
   "caption_accent": "#FFE600"
 }
 ```
+
+Sequential parts, with free overlay placement:
+
+```json
+{
+  "clip_mode": "sequential",
+  "chunk_len": 30,
+  "series_title": "Motivation Series",
+  "show_part_label": true,
+  "burn_subtitles": false,
+  "part_xy":    {"x": 0.22, "y": 0.06},
+  "title_xy":   {"x": 0.50, "y": 0.88},
+  "caption_xy": {"x": 0.50, "y": 0.42}
+}
+```
+
+`*_xy` are fractions of the 1080×1920 frame (`{"x":0.5,"y":0.5}` = dead centre) and
+mark the **centre** of the overlay. Omit them, or send `null`, to use the preset
+position. Out-of-range or malformed values fall back to the preset rather than
+failing the render.
 
 ---
 

@@ -523,6 +523,12 @@ def _chunk_text_cues(segments: list, text_key: str, lead_offset: float, clip_dur
 # Visual tuning (real pixels on the 1080x1920 frame)
 _HI_FONTSIZE    = 60
 _TITLE_FONTSIZE = 64
+_PART_FONTSIZE  = 58          # "Part 3" badge (sequential mode)
+# Default seat for the part badge: top of the frame, above every caption preset.
+_PART_DEFAULT_MARGIN = 60
+# When a dual caption pair is dragged, how far below the Hindi line the English
+# line sits, as a fraction of frame height.
+_DUAL_GAP_FRAC = 0.055
 _EN_FONTSIZE    = 54
 _SINGLE_FONTSIZE = 58
 _SIDE_MARGIN    = 70
@@ -693,6 +699,36 @@ def _style_row(name: str, font: str, preset: dict, align: int, margin_v: int,
     return f"Style: {name},{font},{size},{primary},{primary},{oc},{preset['back']},{tail}"
 
 
+def _norm_xy(xy):
+    """Accept {"x":0.5,"y":0.8} / (0.5,0.8) / [0.5,0.8] and return a clamped
+    (x, y) fraction pair, or None. Anything malformed degrades to None so the
+    caller falls back to the preset position instead of crashing a render."""
+    if not xy:
+        return None
+    try:
+        if isinstance(xy, dict):
+            x, y = float(xy.get("x")), float(xy.get("y"))
+        else:
+            x, y = float(xy[0]), float(xy[1])
+    except (TypeError, ValueError, IndexError, KeyError):
+        return None
+    # Keep text on-canvas: a centre this close to an edge still renders readably.
+    x = min(0.98, max(0.02, x))
+    y = min(0.98, max(0.02, y))
+    return (x, y)
+
+
+def _pos_tag(xy) -> str:
+    """ASS override that pins a line's CENTRE at a fraction of the 1080x1920 frame.
+
+    Used for drag-and-drop placement. Pairs with a style whose Alignment is 5
+    (middle-centre) so \\pos anchors at the text's centre rather than a corner."""
+    p = _norm_xy(xy)
+    if not p:
+        return ""
+    return "{\\pos(%d,%d)}" % (int(round(p[0] * SHORTS_W)), int(round(p[1] * SHORTS_H)))
+
+
 def _text_key_for(language: str) -> str:
     return {"english": "text_en", "hinglish": "text_hinglish"}.get(language, "text")
 
@@ -796,7 +832,12 @@ def make_caption_ass(segments: list, ass_path: str,
                      latin_font: str = "Poppins",
                      lead_offset: float = 0.08,
                      clip_duration: float = None,
-                     video_box: tuple = None) -> tuple:
+                     video_box: tuple = None,
+                     part_label: str = "",
+                     show_part_label: bool = False,
+                     caption_xy=None,
+                     title_xy=None,
+                     part_xy=None) -> tuple:
     """Write ONE ASS file on a 1080x1920 frame.
 
     layout == "single": ONE caption track in `language`, pinned to `position`, styled
@@ -806,27 +847,63 @@ def make_caption_ass(segments: list, ass_path: str,
     layout == "dual"  : the classic two-track look — Devanagari Hindi on TOP and the
                         English translation on the BOTTOM (uses a static style).
 
-    show_title adds a static AI headline (placed opposite the captions). Returns
-    (primary_cue_count, secondary_cue_count, has_title).
+    show_title adds a static headline; show_part_label adds the "Part 3" badge used
+    by sequential mode.
+
+    caption_xy / title_xy / part_xy are optional {"x":0..1,"y":0..1} fractions from
+    the UI's drag-and-drop editor. When given they override the preset position for
+    that overlay and pin its centre exactly there.
+
+    Returns (primary_cue_count, secondary_cue_count, has_title).
     """
     position = position if position in _POS_ALIGN else "bottom"
     title = (title or "").strip()
+    part_label = (part_label or "").strip()
     accent = _hex_to_ass(accent_color) if accent_color else _DEFAULT_ACCENT
     styles = []
     events = []
 
-    # Title always uses a crisp static headline style.
+    cap_xy = _norm_xy(caption_xy)
+    ttl_xy = _norm_xy(title_xy)
+    prt_xy = _norm_xy(part_xy)
+    full_end = clip_duration if clip_duration else 3600
+
+    # Title and part badge use crisp static headline styles.
     title_preset = _style_preset("bold_yellow", accent)
 
     def add_title(default_pos: str):
         if not (show_title and title):
             return False
-        align, mv = _position_layout(default_pos, video_box)
-        styles.append(_style_row("TITLE", latin_font, title_preset, align, mv,
-                                  primary=_TITLE_COLOUR, fontsize=_TITLE_FONTSIZE))
-        end = clip_duration if clip_duration else 3600
-        events.append(f"Dialogue: 0,{_fmt_ass_time(0)},{_fmt_ass_time(end)},TITLE,,0,0,0,,"
-                      f"{_ass_escape(title.upper())}")
+        if ttl_xy:
+            # Free placement: centre-anchored style + a per-line \pos override.
+            styles.append(_style_row("TITLE", latin_font, title_preset, 5, 0,
+                                      primary=_TITLE_COLOUR, fontsize=_TITLE_FONTSIZE))
+            prefix = _pos_tag(ttl_xy)
+        else:
+            align, mv = _position_layout(default_pos, video_box)
+            styles.append(_style_row("TITLE", latin_font, title_preset, align, mv,
+                                      primary=_TITLE_COLOUR, fontsize=_TITLE_FONTSIZE))
+            prefix = ""
+        events.append(f"Dialogue: 0,{_fmt_ass_time(0)},{_fmt_ass_time(full_end)},TITLE,,0,0,0,,"
+                      f"{prefix}{_ass_escape(title.upper())}")
+        return True
+
+    def add_part_label():
+        """The 'Part 3' badge for sequential mode. Defaults to the top of the frame,
+        clear of both caption positions, unless the user dragged it somewhere."""
+        if not (show_part_label and part_label):
+            return False
+        if prt_xy:
+            styles.append(_style_row("PARTNO", latin_font, title_preset, 5, 0,
+                                      primary=_WHITE, fontsize=_PART_FONTSIZE))
+            prefix = _pos_tag(prt_xy)
+        else:
+            styles.append(_style_row("PARTNO", latin_font, title_preset, 8,
+                                      _PART_DEFAULT_MARGIN,
+                                      primary=_WHITE, fontsize=_PART_FONTSIZE))
+            prefix = ""
+        events.append(f"Dialogue: 0,{_fmt_ass_time(0)},{_fmt_ass_time(full_end)},PARTNO,,0,0,0,,"
+                      f"{prefix}{_ass_escape(part_label.upper())}")
         return True
 
     if layout == "dual":
@@ -835,30 +912,53 @@ def make_caption_ass(segments: list, ass_path: str,
         dpreset = _style_preset(dual_name, accent)
         hi_cues = _chunk_word_cues(segments, lead_offset, clip_duration)
         en_cues = _chunk_text_cues(segments, "text_en", lead_offset, clip_duration)
-        styles.append(_style_row("HI", hindi_font, dpreset, 8, 90, fontsize=_HI_FONTSIZE))
-        styles.append(_style_row("EN", latin_font, dpreset, 2, 150, fontsize=_EN_FONTSIZE))
+        # Dragging the caption moves the PAIR: the Hindi line sits at the chosen
+        # point and the English line tucks just beneath it, keeping the stacked look.
+        if cap_xy:
+            hi_y = cap_xy[1]
+            en_y = min(0.98, hi_y + _DUAL_GAP_FRAC)
+            styles.append(_style_row("HI", hindi_font, dpreset, 5, 0, fontsize=_HI_FONTSIZE))
+            styles.append(_style_row("EN", latin_font, dpreset, 5, 0, fontsize=_EN_FONTSIZE))
+            hi_prefix = _pos_tag((cap_xy[0], hi_y))
+            en_prefix = _pos_tag((cap_xy[0], en_y))
+        else:
+            styles.append(_style_row("HI", hindi_font, dpreset, 8, 90, fontsize=_HI_FONTSIZE))
+            styles.append(_style_row("EN", latin_font, dpreset, 2, 150, fontsize=_EN_FONTSIZE))
+            hi_prefix = en_prefix = ""
         has_title = False
         if show_title and title:
-            styles.append(_style_row("TITLE", latin_font, title_preset, 8, 270,
-                                      primary=_TITLE_COLOUR, fontsize=_TITLE_FONTSIZE))
-            end = clip_duration if clip_duration else 3600
-            events.append(f"Dialogue: 0,{_fmt_ass_time(0)},{_fmt_ass_time(end)},TITLE,,0,0,0,,"
-                          f"{_ass_escape(title.upper())}")
+            if ttl_xy:
+                styles.append(_style_row("TITLE", latin_font, title_preset, 5, 0,
+                                          primary=_TITLE_COLOUR, fontsize=_TITLE_FONTSIZE))
+                t_prefix = _pos_tag(ttl_xy)
+            else:
+                styles.append(_style_row("TITLE", latin_font, title_preset, 8, 270,
+                                          primary=_TITLE_COLOUR, fontsize=_TITLE_FONTSIZE))
+                t_prefix = ""
+            events.append(f"Dialogue: 0,{_fmt_ass_time(0)},{_fmt_ass_time(full_end)},TITLE,,0,0,0,,"
+                          f"{t_prefix}{_ass_escape(title.upper())}")
             has_title = True
         up = dpreset["upper"]
         for c_start, c_end, text in hi_cues:
-            events.append(f"Dialogue: 0,{_fmt_ass_time(c_start)},{_fmt_ass_time(c_end)},HI,,0,0,0,,{_ass_escape(text)}")
+            events.append(f"Dialogue: 0,{_fmt_ass_time(c_start)},{_fmt_ass_time(c_end)},HI,,0,0,0,,{hi_prefix}{_ass_escape(text)}")
         for c_start, c_end, text in en_cues:
             t = text.upper() if up else text
-            events.append(f"Dialogue: 0,{_fmt_ass_time(c_start)},{_fmt_ass_time(c_end)},EN,,0,0,0,,{_ass_escape(t)}")
+            events.append(f"Dialogue: 0,{_fmt_ass_time(c_start)},{_fmt_ass_time(c_end)},EN,,0,0,0,,{en_prefix}{_ass_escape(t)}")
+        add_part_label()
         primary_count, secondary_count = len(hi_cues), len(en_cues)
     else:
         # Single track: one chosen language at one position, in the chosen style.
         preset = _style_preset(caption_style, accent)
         text_key = _text_key_for(language)
         font = hindi_font if language == "hindi" else latin_font
-        sub_align, sub_mv = _position_layout(position, video_box)
-        styles.append(_style_row("SUB", font, preset, sub_align, sub_mv))
+        if cap_xy:
+            # Free placement: centre-anchored style, exact \pos per line.
+            styles.append(_style_row("SUB", font, preset, 5, 0))
+            cap_prefix = _pos_tag(cap_xy)
+        else:
+            sub_align, sub_mv = _position_layout(position, video_box)
+            styles.append(_style_row("SUB", font, preset, sub_align, sub_mv))
+            cap_prefix = ""
 
         if preset["anim"] == "karaoke":
             ev = _karaoke_events(segments, text_key, lead_offset, clip_duration, preset)
@@ -873,8 +973,11 @@ def make_caption_ass(segments: list, ass_path: str,
         # Title goes opposite the captions to avoid overlap.
         title_pos = "below" if position == "top" else "top"
         has_title = add_title(title_pos)
+        add_part_label()
+        # \pos must lead the line; animated styles then append their own override
+        # blocks after it, which ASS applies cumulatively.
         for s, e, text in ev:
-            events.append(f"Dialogue: 0,{_fmt_ass_time(s)},{_fmt_ass_time(e)},SUB,,0,0,0,,{text}")
+            events.append(f"Dialogue: 0,{_fmt_ass_time(s)},{_fmt_ass_time(e)},SUB,,0,0,0,,{cap_prefix}{text}")
         primary_count, secondary_count = len(ev), 0
 
     header = (
@@ -1082,7 +1185,12 @@ def burn_subtitles_for_clip(raw_path: str, clip_index: int, job_dir: str, clips_
                              hindi_font_choice: str = "",
                              english_font_choice: str = "",
                              show_title: bool = False,
-                             src_dims: tuple = None) -> str:
+                             src_dims: tuple = None,
+                             part_label: str = "",
+                             show_part_label: bool = False,
+                             caption_xy=None,
+                             title_xy=None,
+                             part_xy=None) -> str:
     """Renders ONE finished 9:16 Short in a single ffmpeg pass.
 
     `raw_path` is the SOURCE video; we seek into it with -ss/-to instead of cutting a
@@ -1094,13 +1202,18 @@ def burn_subtitles_for_clip(raw_path: str, clip_index: int, job_dir: str, clips_
     caption_style        -> "outline" (text + outline) or "box" (solid background).
     show_title           -> add the static AI headline overlay.
     """
-    final_output = os.path.join(clips_dir, f"viral_clip_{clip_index}.mp4")
+    # Sequential parts are named part_1.mp4, part_2.mp4 … so the running order is
+    # obvious in the file manager and when uploading a series.
+    stem = f"part_{clip_index}" if part_label else f"viral_clip_{clip_index}"
+    final_output = os.path.join(clips_dir, f"{stem}.mp4")
 
     log.log(f"\n   Clip {clip_index}  [{clip_start:.2f}s–{clip_end:.2f}s]"
             if clip_start is not None else f"\n   Clip {clip_index}")
     log.log(f"     Source : {raw_path}")
     log.log(f"     Captions: burn={burn} layout={layout} lang={language} pos={position} "
             f"style={caption_style} title={show_title}")
+    if part_label:
+        log.log(f"     Part   : {part_label} (badge={'on' if show_part_label else 'off'})")
     log.log(f"     Output : {final_output}")
 
     if not os.path.exists(raw_path):
@@ -1113,10 +1226,42 @@ def burn_subtitles_for_clip(raw_path: str, clip_index: int, job_dir: str, clips_
         clip_duration = (clip_end - clip_start) if (clip_start is not None and clip_end is not None) else None
         vf = None
 
-        if not burn:
+        # The part badge and a fixed series title are independent of captions: a
+        # sequential job with subtitles OFF still needs "Part 3" burned on. So the
+        # overlay path runs whenever ANY of the three overlays is wanted.
+        want_badge = bool(show_part_label and part_label)
+        want_title = bool(show_title and title)
+        overlay_only = (not burn) and (want_badge or want_title)
+
+        if not burn and not overlay_only:
             # ── No-subtitle path: clean 9:16 video, nothing overlaid. ──
             log.log("     Subtitles OFF -> rendering clean 9:16 clip (no captions).")
             vf = _build_render_filter("", "")
+        elif overlay_only:
+            # ── Badge/title only: no transcript needed, so nothing is transcribed. ──
+            log.log(f"     Subtitles OFF -> overlay-only render "
+                    f"(part={'yes' if want_badge else 'no'}, title={'yes' if want_title else 'no'}).")
+            _la_path, _la_family = _font_from_choice(english_font_choice, ENGLISH_FONTS, _get_latin_font)
+            fontsdir = _prepare_fontsdir([_la_path], job_dir)
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".ass", delete=False,
+                dir=job_dir, prefix=f"clip{clip_index}_", encoding="utf-8"
+            ) as tmp:
+                ass_path = tmp.name
+            primary, secondary, has_title = make_caption_ass(
+                [], ass_path,
+                layout="single", language="english", position=position,
+                caption_style=caption_style, accent_color=accent_color,
+                title=title, show_title=show_title,
+                hindi_font="Noto Sans Devanagari",
+                latin_font=_la_family or "Poppins",
+                clip_duration=clip_duration,
+                video_box=_video_box(*(src_dims if src_dims and src_dims[0]
+                                       else _probe_dimensions(raw_path, log))),
+                part_label=part_label, show_part_label=show_part_label,
+                caption_xy=caption_xy, title_xy=title_xy, part_xy=part_xy,
+            )
+            vf = _build_render_filter(ass_path, fontsdir)
         else:
             # 1. Ensure we have clip-local segments (with whatever language fields we need).
             if segments is None:
@@ -1181,6 +1326,11 @@ def burn_subtitles_for_clip(raw_path: str, clip_index: int, job_dir: str, clips_
                 latin_font=latin_family,
                 clip_duration=clip_duration,
                 video_box=vbox,
+                part_label=part_label,
+                show_part_label=show_part_label,
+                caption_xy=caption_xy,
+                title_xy=title_xy,
+                part_xy=part_xy,
             )
             log.log(f"     Tracks : {primary} primary cues / {secondary} secondary cues / "
                     f"title={'yes' if has_title else 'no'} (fontsdir={fontsdir or 'system'})")
@@ -1317,6 +1467,16 @@ def execute_subtitle_workflow(
         hindi_font_choice   = str(cfg.get("hindi_font", "") or "").lower()
         english_font_choice = str(cfg.get("english_font", "") or "").lower()
         show_title    = bool(cfg.get("show_title", False))
+        # Sequential extras + free (drag-and-drop) overlay placement.
+        series_title    = str(cfg.get("series_title", "") or "").strip()
+        show_part_label = bool(cfg.get("show_part_label", True))
+        caption_xy = _norm_xy(cfg.get("caption_xy"))
+        title_xy   = _norm_xy(cfg.get("title_xy"))
+        part_xy    = _norm_xy(cfg.get("part_xy"))
+        # A user-supplied series title is a fixed headline on every part, so it takes
+        # the existing title slot and makes the AI title pass unnecessary.
+        if series_title:
+            show_title = True
         if layout not in ("single", "dual"):
             layout = "single"
         if language not in ("hindi", "english", "hinglish"):
@@ -1434,9 +1594,13 @@ def execute_subtitle_workflow(
                     if layout == "dual":
                         layout = "single"
                     language = "hindi"
-            if show_title:
+            # A fixed series title is used verbatim on every clip, so there is
+            # nothing for the AI title pass to do — skip the extra LLM call.
+            if show_title and not series_title:
                 titles = batch_generate_titles(all_segment_lists, log)
                 clip_titles = {order[i]: titles[i] for i in range(len(order))}
+            elif series_title:
+                log.log(f"   Series title: \"{series_title}\" (AI title generation skipped)")
 
             # Persist a single combined transcript file for reference.
             try:
@@ -1500,7 +1664,8 @@ def execute_subtitle_workflow(
                 clip_callback=clip_callback, reason=rc.get("reason", ""),
                 clip_start=rc.get("start"), clip_end=rc.get("end"),
                 segments=clip_segments.get(idx),
-                title=clip_titles.get(idx, ""),
+                # A fixed series title wins over the per-clip AI headline.
+                title=series_title or clip_titles.get(idx, ""),
                 burn=burn,
                 layout=layout,
                 language=language,
@@ -1511,6 +1676,11 @@ def execute_subtitle_workflow(
                 english_font_choice=english_font_choice,
                 show_title=show_title,
                 src_dims=src_dims,
+                part_label=rc.get("part_label", ""),
+                show_part_label=show_part_label,
+                caption_xy=caption_xy,
+                title_xy=title_xy,
+                part_xy=part_xy,
             )
             done_count["n"] += 1
             if status_callback:
