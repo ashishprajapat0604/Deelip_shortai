@@ -25,6 +25,7 @@ app = FastAPI(title="Viral Clip Pipeline API")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
 OUTPUT_DIR = os.path.join(BASE_DIR, "output")
+FONTS_DIR = os.path.join(BASE_DIR, "fonts")
 ENV_PATH = os.path.join(BASE_DIR, ".env")
 JOBS_INDEX = os.path.join(OUTPUT_DIR, "_jobs.json")
 
@@ -92,6 +93,64 @@ _load_jobs()
 def serve_frontend():
     """Serves the main frontend UI."""
     return FileResponse(os.path.join(BASE_DIR, "templates", "index.html"))
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+def serve_favicon():
+    """Browsers request this unprompted; without it every page load logs a 404."""
+    path = os.path.join(BASE_DIR, "assets", "shortsai.ico")
+    if not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="No icon bundled")
+    return FileResponse(path, media_type="image/x-icon",
+                        headers={"Cache-Control": "public, max-age=604800"})
+
+
+@app.get("/fonts/{filename}", tags=["UI"])
+def serve_caption_font(filename: str):
+    """Serve a bundled caption TTF to the browser.
+
+    The live preview loads the SAME file ffmpeg burns in, so what you see in the
+    9:16 stage is the real typeface rather than a look-alike. It also means the UI
+    works with no internet connection, which the old web-font <link> did not."""
+    if "/" in filename or "\\" in filename or ".." in filename:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    if not filename.lower().endswith(".ttf"):
+        raise HTTPException(status_code=400, detail="Only .ttf files are served")
+
+    path = os.path.join(FONTS_DIR, filename)
+    if not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="Font not bundled")
+
+    return FileResponse(
+        path,
+        media_type="font/ttf",
+        headers={"Cache-Control": "public, max-age=604800"},
+    )
+
+
+@app.get("/api/fonts", tags=["UI"])
+def api_caption_fonts():
+    """Which caption fonts are actually on disk.
+
+    fetch_fonts only manages to grab some of them on a lot of machines. The UI uses
+    this to disable the ones that are missing instead of previewing a font that the
+    renderer would silently swap for a fallback."""
+    def pack(table):
+        return [
+            {
+                "key": key,
+                "family": family,
+                "file": fname,
+                "url": f"/fonts/{fname}",
+                "available": os.path.isfile(os.path.join(FONTS_DIR, fname)),
+            }
+            for key, (family, fname) in table.items()
+        ]
+
+    return {
+        "hindi": pack(burn_subtitles.HINDI_FONTS),
+        "english": pack(burn_subtitles.ENGLISH_FONTS),
+    }
 
 
 # ─────────────────────────────────────────────────────────────

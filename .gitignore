@@ -48,3 +48,6 @@ workflow-files.zip
 
 # Temp script run.py writes while creating the Windows shortcut
 .shortcut.ps1
+
+# Claude Code local (machine-specific) settings
+.claude/settings.local.json
