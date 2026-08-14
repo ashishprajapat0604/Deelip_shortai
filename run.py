@@ -47,8 +47,10 @@ FONTS_DIR = HERE / "fonts"
 # ── Font catalogue ─────────────────────────────────────────────────────────────
 FONT_URLS = {
     # Hindi / Devanagari
+    # THE critical font: without a Devanagari face, Hindi captions render as empty
+    # boxes. The old notofonts/devanagari path 404s; this mirror is the live one.
     "NotoSansDevanagari-Bold.ttf":
-        "https://github.com/notofonts/devanagari/raw/main/fonts/NotoSansDevanagari/hinted/ttf/NotoSansDevanagari-Bold.ttf",
+        "https://github.com/notofonts/notofonts.github.io/raw/main/fonts/NotoSansDevanagari/hinted/ttf/NotoSansDevanagari-Bold.ttf",
     "Mukta-Bold.ttf":
         "https://github.com/google/fonts/raw/main/ofl/mukta/Mukta-Bold.ttf",
     "Hind-Bold.ttf":
@@ -57,12 +59,20 @@ FONT_URLS = {
         "https://github.com/google/fonts/raw/main/ofl/rozhaone/RozhaOne-Regular.ttf",
     "Kalam-Bold.ttf":
         "https://github.com/google/fonts/raw/main/ofl/kalam/Kalam-Bold.ttf",
+    # Google Fonts ships these three only as VARIABLE fonts — there is no
+    # static -Bold.ttf in the repo, so the old static URLs 404'd and the app
+    # offered three fonts it could never render. The [wght] file works fine:
+    # libass synthesises the weight from the ASS style's Bold flag.
     "Baloo2-Bold.ttf":
-        "https://github.com/google/fonts/raw/main/ofl/baloo2/Baloo2-Bold.ttf",
+        "https://github.com/google/fonts/raw/main/ofl/baloo2/Baloo2%5Bwght%5D.ttf",
     "Laila-Bold.ttf":
         "https://github.com/google/fonts/raw/main/ofl/laila/Laila-Bold.ttf",
     "Rajdhani-Bold.ttf":
         "https://github.com/google/fonts/raw/main/ofl/rajdhani/Rajdhani-Bold.ttf",
+    "Khand-Bold.ttf":
+        "https://github.com/google/fonts/raw/main/ofl/khand/Khand-Bold.ttf",
+    "Teko-Bold.ttf":
+        "https://github.com/google/fonts/raw/main/ofl/teko/Teko%5Bwght%5D.ttf",
     # English / Latin
     "Poppins-Bold.ttf":
         "https://github.com/google/fonts/raw/main/ofl/poppins/Poppins-Bold.ttf",
@@ -74,10 +84,11 @@ FONT_URLS = {
         "https://github.com/google/fonts/raw/main/ofl/archivoblack/ArchivoBlack-Regular.ttf",
     "FjallaOne-Regular.ttf":
         "https://github.com/google/fonts/raw/main/ofl/fjallaone/FjallaOne-Regular.ttf",
+    # Variable-only upstream, same as Baloo 2 above.
     "Oswald-Bold.ttf":
-        "https://github.com/google/fonts/raw/main/ofl/oswald/Oswald-Bold.ttf",
+        "https://github.com/google/fonts/raw/main/ofl/oswald/Oswald%5Bwght%5D.ttf",
     "Montserrat-Bold.ttf":
-        "https://github.com/google/fonts/raw/main/ofl/montserrat/Montserrat-Bold.ttf",
+        "https://github.com/google/fonts/raw/main/ofl/montserrat/Montserrat%5Bwght%5D.ttf",
     "Staatliches-Regular.ttf":
         "https://github.com/google/fonts/raw/main/ofl/staatliches/Staatliches-Regular.ttf",
     "BarlowCondensed-Bold.ttf":

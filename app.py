@@ -147,9 +147,12 @@ def api_caption_fonts():
             for key, (family, fname) in table.items()
         ]
 
+    # Only fonts whose file is really on disk. A font that failed to download would
+    # otherwise preview as itself and render as something else entirely.
     return {
-        "hindi": pack(burn_subtitles.HINDI_FONTS),
-        "english": pack(burn_subtitles.ENGLISH_FONTS),
+        "hindi": pack(burn_subtitles.available_fonts(burn_subtitles.HINDI_FONTS)),
+        "english": pack(burn_subtitles.available_fonts(burn_subtitles.ENGLISH_FONTS)),
+        "styles": burn_subtitles.caption_style_catalogue(),
     }
 
 
@@ -274,7 +277,7 @@ def select_clips_from_url(payload: SelectClipsURLRequest):
 
     thread = threading.Thread(
         target=_run_selection,
-        args=(job_id, payload.url, None, payload.options),
+        args=(job_id, payload.url, None, _apply_logo_option(payload.options)),
         daemon=True,
     )
     thread.start()
@@ -304,6 +307,7 @@ def select_clips_from_upload(
             parsed_options = json.loads(options)
         except json.JSONDecodeError:
             raise HTTPException(status_code=400, detail="`options` must be valid JSON")
+    parsed_options = _apply_logo_option(parsed_options)
 
     _set_job(job_id, status="queued", message="Job queued", uploaded_path=upload_path)
 
@@ -363,7 +367,7 @@ def process_from_url(payload: SelectClipsURLRequest):
 
     thread = threading.Thread(
         target=_run_full_pipeline,
-        args=(job_id, payload.url, None, payload.options),
+        args=(job_id, payload.url, None, _apply_logo_option(payload.options)),
         daemon=True,
     )
     thread.start()
@@ -389,6 +393,7 @@ def process_from_upload(
             parsed_options = json.loads(options)
         except json.JSONDecodeError:
             raise HTTPException(status_code=400, detail="`options` must be valid JSON")
+    parsed_options = _apply_logo_option(parsed_options)
 
     _set_job(job_id, status="queued", message="Job queued", uploaded_path=upload_path)
 
@@ -480,6 +485,11 @@ def download_all_clips(job_id: str):
             if os.path.exists(c):
                 zf.write(c, arcname=os.path.basename(c))
                 added += 1
+                # Each clip's posting sheet (titles, caption, hashtags, guidelines)
+                # rides along beside it so the download is self-contained.
+                sheet = f"{os.path.splitext(c)[0]}_POST.txt"
+                if os.path.exists(sheet):
+                    zf.write(sheet, arcname=os.path.basename(sheet))
 
     if added == 0:
         raise HTTPException(status_code=404, detail="No clip files found on disk")
@@ -523,6 +533,54 @@ def get_highlights(job_id: str):
         raise HTTPException(status_code=400, detail="Highlights not ready yet")
 
     return {"job_id": job_id, "highlights": highlights}
+
+
+@app.get("/jobs/{job_id}/publish-kit")
+def get_publish_kit(job_id: str):
+    """Titles, captions, hashtags, posting guidelines and the AI council's ranking.
+
+    Written by the burn stage into <job_dir>/publish_kit.json. Returns 404 until
+    that stage finishes, so the UI can simply poll for it."""
+    job = _get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    job_dir = job.get("job_dir")
+    if not job_dir:
+        raise HTTPException(status_code=400, detail="Job directory not available yet")
+
+    path = os.path.join(job_dir, "publish_kit.json")
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Publish kit not ready yet")
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        raise HTTPException(status_code=500, detail=f"Could not read publish kit: {e}")
+
+    return {"job_id": job_id, **data}
+
+
+@app.get("/jobs/{job_id}/clips/{filename}/post")
+def download_post_sheet(job_id: str, filename: str):
+    """Download one clip's posting sheet as a .txt."""
+    job = _get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    job_dir = job.get("job_dir")
+    if not job_dir:
+        raise HTTPException(status_code=400, detail="Job directory not available yet")
+    if "/" in filename or "\\" in filename or ".." in filename:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+
+    sheet = os.path.join(job_dir, "clips", f"{os.path.splitext(filename)[0]}_POST.txt")
+    if not os.path.exists(sheet):
+        raise HTTPException(status_code=404, detail="No posting sheet for this clip")
+
+    return FileResponse(sheet, media_type="text/plain",
+                        filename=os.path.basename(sheet))
 
 
 @app.delete("/jobs/{job_id}")
@@ -666,6 +724,82 @@ def _write_env_file(values: dict):
         os.chmod(ENV_PATH, 0o600)   # the file holds secrets — keep it owner-only
     except OSError:
         pass
+
+
+LOGO_DIR = os.path.join(UPLOAD_DIR, "logos")
+os.makedirs(LOGO_DIR, exist_ok=True)
+
+_LOGO_TYPES = {"image/png": ".png", "image/webp": ".webp", "image/jpeg": ".jpg"}
+_LOGO_MAX_BYTES = 8 * 1024 * 1024
+
+
+@app.post("/api/logo", tags=["UI"])
+def api_upload_logo(file: UploadFile = File(...)):
+    """Store a watermark image and hand back the token to put in a job's options.
+
+    PNG is what you want (transparency); WebP and JPEG are accepted because people
+    paste whatever their logo happens to be saved as."""
+    ctype = (file.content_type or "").lower()
+    ext = _LOGO_TYPES.get(ctype)
+    if not ext:
+        raise HTTPException(
+            status_code=400,
+            detail="Logo must be a PNG, WebP or JPEG. PNG keeps transparency.")
+
+    token = f"{uuid4().hex}{ext}"
+    path = os.path.join(LOGO_DIR, token)
+    size = 0
+    try:
+        with open(path, "wb") as out:
+            while chunk := file.file.read(1024 * 1024):
+                size += len(chunk)
+                if size > _LOGO_MAX_BYTES:
+                    raise HTTPException(status_code=413,
+                                        detail="Logo must be under 8 MB.")
+                out.write(chunk)
+    except HTTPException:
+        # Remove the partial file so a rejected upload leaves nothing behind.
+        try: os.remove(path)
+        except OSError: pass
+        raise
+
+    return {"logo": token, "url": f"/api/logo/{token}", "bytes": size}
+
+
+@app.get("/api/logo/{token}", tags=["UI"])
+def api_get_logo(token: str):
+    """Serve an uploaded logo back so the editor can preview the real image."""
+    path = _resolve_logo(token)
+    if not path:
+        raise HTTPException(status_code=404, detail="Logo not found")
+    return FileResponse(path)
+
+
+def _resolve_logo(token: str) -> Optional[str]:
+    """Map an upload token to its file, refusing anything that escapes LOGO_DIR."""
+    token = (token or "").strip()
+    if not token or "/" in token or "\\" in token or ".." in token:
+        return None
+    path = os.path.join(LOGO_DIR, token)
+    # realpath before the prefix test, so a symlink cannot point outside either.
+    if not os.path.realpath(path).startswith(os.path.realpath(LOGO_DIR) + os.sep):
+        return None
+    return path if os.path.isfile(path) else None
+
+
+def _apply_logo_option(options: Optional[dict]) -> Optional[dict]:
+    """Swap the client's opaque logo token for a real path on this machine.
+
+    The browser never learns a filesystem path, and an unknown token silently means
+    'no watermark' rather than failing a job that is otherwise fine."""
+    if not options:
+        return options
+    token = options.pop("logo", None)
+    if token:
+        path = _resolve_logo(str(token))
+        if path:
+            options["logo_path"] = path
+    return options
 
 
 @app.get("/api/status")

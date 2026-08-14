@@ -315,6 +315,41 @@ _SENTENCE_END_CHARS = (".", "!", "?", "।", "॥", "…")
 DEFAULT_MIN_CLIP_LEN = 20.0
 DEFAULT_MAX_CLIP_LEN = 40.0
 
+# Hard limits on what the user is allowed to ask for. 7s is the shortest clip that
+# can still land a joke; 90s (1:30) is the ceiling every short-form surface accepts
+# (Reels, Shorts and TikTok all cut off past this). The UI slider spans exactly this
+# range, and anything arriving over the API is clamped into it.
+CLIP_LEN_FLOOR = 7.0
+CLIP_LEN_CEIL = 90.0
+
+
+def clamp_clip_bounds(min_len, max_len, log=None) -> tuple:
+    """Force a (min, max) clip-length pair into [CLIP_LEN_FLOOR, CLIP_LEN_CEIL].
+
+    Bad input never fails a job: unparseable values fall back to the defaults, and
+    an inverted pair is swapped rather than rejected."""
+    def _num(value, fallback):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return fallback
+
+    lo = _num(min_len, DEFAULT_MIN_CLIP_LEN)
+    hi = _num(max_len, DEFAULT_MAX_CLIP_LEN)
+    if lo > hi:
+        lo, hi = hi, lo
+    lo = max(CLIP_LEN_FLOOR, min(CLIP_LEN_CEIL, lo))
+    hi = max(CLIP_LEN_FLOOR, min(CLIP_LEN_CEIL, hi))
+    if hi <= lo:
+        # A zero-width window would make snapping impossible — give it room to breathe.
+        hi = min(CLIP_LEN_CEIL, lo + 5.0)
+        if hi <= lo:
+            lo = max(CLIP_LEN_FLOOR, hi - 5.0)
+    if log and (lo, hi) != (_num(min_len, lo), _num(max_len, hi)):
+        log.log(f"  Clip length {min_len}–{max_len}s clamped to "
+                f"{lo:.0f}–{hi:.0f}s (allowed {CLIP_LEN_FLOOR:.0f}–{CLIP_LEN_CEIL:.0f}s)")
+    return lo, hi
+
 
 def _ends_a_sentence(text: str) -> bool:
     text = (text or "").strip()
@@ -489,17 +524,42 @@ SELECTION_MODEL_PRIMARY  = os.environ.get("GROQ_SELECTION_MODEL", "llama-3.3-70b
 SELECTION_MODEL_FALLBACK = os.environ.get("GROQ_SELECTION_MODEL_FALLBACK", "llama-3.1-8b-instant")
 SELECTION_CHUNK_CHARS    = int(os.environ.get("SELECTION_CHUNK_CHARS", "6000"))
 
-_SELECTION_PROMPT_HEADER = """You are a short-form content strategist for Instagram/Facebook Reels and YouTube Shorts.
-Pick the moments from this transcript portion that would perform best as standalone vertical clips.
+def _selection_prompt_header(min_len: float, max_len: float) -> str:
+    """The selector's brief. Written around ONE objective — views — because that is
+    what the client is optimising for. Length bounds are injected so the model is
+    told the real window the renderer will enforce."""
+    return f"""You are a viral short-form strategist for Instagram Reels and YouTube Shorts.
+Your ONLY objective is VIEWS. You are not summarising the video and you are not
+looking for the "most important" parts — you are hunting the moments that would make
+a stranger stop scrolling, watch to the end, and send it to a friend.
 
-WHAT MAKES A CLIP WORK:
-1. HOOK IN THE FIRST 3 SECONDS - opens on a bold claim, surprising fact, question, or strong emotion.
-2. SELF-CONTAINED - understandable with zero outside context.
-3. EMOTIONAL / CONTROVERSIAL PEAK - strong feeling beats neutral info.
-4. PAYOFF NEAR THE END - builds to a punchline, revelation, or resolution.
-5. ENDS ON A COMPLETE THOUGHT - never stop mid-sentence.
+WHAT ACTUALLY GOES VIRAL (in priority order):
+1. STOPS THE SCROLL IN 3 SECONDS — the first spoken line must be a bold claim, a
+   shocking number, conflict, a question the viewer needs answered, or raw emotion.
+   A moment that needs 10 seconds of build-up is worthless no matter how good it gets.
+2. EMOTIONAL SPIKE — anger, shock, laughter, secondhand embarrassment, awe, outrage.
+   Neutral information does not travel. Strong feeling does.
+3. SHAREABLE / ARGUABLE — would someone tag a friend, or fight in the comments?
+   Opinions, hot takes, callouts and relatable pain beat balanced explanation.
+4. SELF-CONTAINED — it must make full sense to someone who has never seen this video
+   and has no idea who is talking.
+5. PAYOFF BEFORE THE END — a punchline, twist, reveal or resolution lands inside the
+   clip. If the moment only sets something up, it is not a clip.
+6. ENDS ON A COMPLETE THOUGHT — never stop mid-sentence.
 
-Each clip must be 20-40 seconds and start at the beginning of a sentence."""
+REJECT: intros, outros, greetings, sponsor reads, housekeeping, "as I was saying",
+setup with no payoff, and anything that is merely informative but emotionally flat.
+
+SCORING (1-10) — score PREDICTED VIEWS, not quality or importance:
+  10  would genuinely take off — instant hook plus a strong emotional payoff
+  7-9 strong scroll-stopper with a clear payoff
+  4-6 watchable but nothing that compels a share
+  1-3 flat, slow, or needs outside context — do not pick these
+
+Be selective. Returning three excellent moments beats returning ten mediocre ones.
+
+Each clip must be between {min_len:.0f} and {max_len:.0f} seconds and must start at the
+beginning of a sentence."""
 
 # Cap the user's brief so a pasted essay can't crowd the transcript out of the
 # context window (the transcript is what the model actually has to reason over).
@@ -564,7 +624,9 @@ def _call_selection_llm(client, prompt: str, log: DiagnosticLog):
 
 
 def select_highlights_chunked(segments: list, num_clips: int, per_chunk: int,
-                              log: DiagnosticLog, clip_prompt: str = "") -> list:
+                              log: DiagnosticLog, clip_prompt: str = "",
+                              min_len: float = DEFAULT_MIN_CLIP_LEN,
+                              max_len: float = DEFAULT_MAX_CLIP_LEN) -> list:
     """Run the LLM selector across transcript chunks and merge the picks.
 
     `clip_prompt` is the user's free-text description of the clips they want; when
@@ -587,7 +649,7 @@ def select_highlights_chunked(segments: list, num_clips: int, per_chunk: int,
     all_picks = []
     for ci, chunk in enumerate(chunks):
         chunk_text = "".join(f"[{s['start']:.2f} - {s['end']:.2f}] {s['text']}\n" for s in chunk)
-        prompt = f"""{_SELECTION_PROMPT_HEADER}{brief}
+        prompt = f"""{_selection_prompt_header(min_len, max_len)}{brief}
 
 TASK:
 From the transcript portion below, return up to {per_chunk} of the strongest clip(s). Use the
@@ -723,6 +785,269 @@ def sequential_parts(duration: float, chunk_len: float, log: DiagnosticLog,
 
 
 # ─────────────────────────────────────────────────────────────
+# Hook-first: the 3-second cold open
+# ─────────────────────────────────────────────────────────────
+# Viral reels rarely open where the clip opens. They front-load the climax — the
+# punchline, the reveal, the shout — for ~3 seconds, THEN roll the clip from its
+# real beginning. The peak is therefore seen twice, which is the point: the viewer
+# stays because they now know a payoff is coming.
+#
+# We pick that peak window INSIDE each clip (never from elsewhere in the video), so
+# the cold open is always something the clip actually delivers on.
+
+HOOK_LEN_DEFAULT = 3.0
+
+# The hook flexes around the target so it can land on a complete spoken line. A
+# fixed 3.00s cut is what made the old version feel like a random fragment.
+HOOK_MIN_LEN = 1.6
+HOOK_MAX_LEN = 5.5
+
+# A hook only makes sense when the body is long enough to feel like a separate
+# thing. Prepending 3s to an 8s clip just makes it stutter, so short clips are left
+# alone and reported as skipped.
+HOOK_MIN_CLIP_LEN = 10.0
+
+# Clips per hook-picking call — the reply is one line each, so this can be generous.
+_HOOK_BATCH = 14
+
+
+def _segments_within(segments: list, start: float, end: float) -> list:
+    """Segments overlapping [start, end], in order."""
+    return [s for s in segments
+            if s.get("end", 0) > start and s.get("start", 0) < end]
+
+
+def _text_between(segments: list, start: float, end: float, limit: int = 220) -> str:
+    txt = " ".join((s.get("text") or "").strip()
+                   for s in _segments_within(segments, start, end)).strip()
+    txt = " ".join(txt.split())
+    return txt[:limit] + ("…" if len(txt) > limit else "")
+
+
+def _words_between(segments: list, start: float, end: float) -> list:
+    """Every word timestamp overlapping [start, end], in order."""
+    out = []
+    for seg in _segments_within(segments, start, end):
+        for w in seg.get("words", []):
+            if w.get("end", 0) > start and w.get("start", 0) < end:
+                out.append(w)
+    return out
+
+
+def _snap_hook(anchor: float, segments: list, clip_start: float, clip_end: float,
+               target_len: float):
+    """Turn a rough anchor time into a hook window that is a COMPLETE SPOKEN PHRASE.
+
+    A raw N-second slice is what made the old cold open feel like a random clip: it
+    started halfway through one word and stopped halfway through another, so the
+    viewer heard a fragment with no meaning. Instead:
+
+      - start on the SEGMENT boundary at or just before the anchor, so the hook opens
+        on the first word of a line rather than mid-word;
+      - extend through whole segments until the window is at least the target length;
+      - if that overshoots HOOK_MAX_LEN, cut back to the last WORD boundary that fits,
+        so the hook still ends on a finished word rather than a clipped syllable.
+
+    Returns (start, end) or None when the clip cannot host a sensible hook.
+    """
+    if clip_end - clip_start < HOOK_MIN_CLIP_LEN:
+        return None
+
+    inside = [s for s in segments
+              if s.get("start", 0) >= clip_start - 0.01 and s.get("end", 0) <= clip_end + 0.01]
+    if not inside:
+        # No transcript for this stretch — fall back to a plain window, still clamped.
+        hs = min(max(anchor, clip_start), max(clip_start, clip_end - target_len))
+        he = min(hs + target_len, clip_end)
+        return (round(hs, 3), round(he, 3)) if he - hs >= HOOK_MIN_LEN else None
+
+    # Open on the line containing (or nearest before) the anchor.
+    at_or_before = [s for s in inside if s["start"] <= anchor + 0.25]
+    opener = at_or_before[-1] if at_or_before else inside[0]
+    hs = float(opener["start"])
+
+    # Grow through whole lines until we have enough to be worth watching.
+    he = float(opener["end"])
+    for seg in inside:
+        if seg["start"] < opener["start"] - 0.01:
+            continue
+        he = float(seg["end"])
+        if he - hs >= target_len:
+            break
+
+    # Too long: cut back to the last word that finishes inside the ceiling.
+    if he - hs > HOOK_MAX_LEN:
+        limit = hs + HOOK_MAX_LEN
+        ends = [float(w["end"]) for w in _words_between(segments, hs, limit + 0.01)
+                if float(w["end"]) <= limit + 0.01 and float(w["end"]) - hs >= HOOK_MIN_LEN]
+        he = max(ends) if ends else limit
+
+    he = min(he, clip_end)
+    if he - hs < HOOK_MIN_LEN:
+        return None
+    return round(hs, 3), round(he, 3)
+
+
+def _hook_heuristic(clip_start: float, clip_end: float, segments: list,
+                    hook_len: float):
+    """No-AI fallback: open on the line nearest the clip's payoff zone (~65% of the
+    way in), which is where punchlines and reveals usually land."""
+    if clip_end - clip_start < HOOK_MIN_CLIP_LEN:
+        return None
+    return _snap_hook(clip_start + (clip_end - clip_start) * 0.65,
+                      segments, clip_start, clip_end, hook_len)
+
+
+def _ask_llm_for_hooks(eligible: list, segments: list, hook_len: float,
+                       log: DiagnosticLog) -> dict:
+    """One call per batch. Returns {clip_id: hook_start_seconds}."""
+    picks = {}
+    batches = [eligible[i:i + _HOOK_BATCH] for i in range(0, len(eligible), _HOOK_BATCH)]
+
+    for bi, batch in enumerate(batches):
+        blocks = []
+        for cid, h in batch:
+            lines = "".join(
+                f"    [{s['start']:.2f}] {(s.get('text') or '').strip()}\n"
+                for s in _segments_within(segments, h["start"], h["end"])
+            )
+            blocks.append(
+                f"CLIP {cid}  (plays from {h['start']:.2f}s to {h['end']:.2f}s — the hook "
+                f"must start between {h['start']:.2f} and {h['end'] - hook_len:.2f})\n"
+                f"{lines or '    (no speech)'}"
+            )
+        prompt = f"""You are editing viral Reels. Each clip below gets a COLD OPEN spliced onto
+its front: you choose ONE LINE from inside the clip, that line plays first, and then
+the whole clip plays from its real beginning.
+
+PICK THE LINE THAT WOULD MAKE A STRANGER STOP SCROLLING. That means:
+  - the punchline, the reveal, the twist, or the single most shocking sentence
+  - a bold claim, a number, an insult, a confession, or raw emotion
+  - a line that makes no sense on its own and MAKES YOU NEED THE CONTEXT
+
+NEVER pick:
+  - the clip's own first line (the viewer hears it two seconds later anyway)
+  - filler, throat-clearing or narration: "so", "anyway", "now what is going on here",
+    "let me tell you", "as I said", "moving on", "today I'm going to"
+  - a question the clip never answers, or a line that is purely setup
+
+Return the EXACT start timestamp of the chosen line, copied from the list. Pick the
+line itself — the length is handled for you, so do not try to hit {hook_len:.0f} seconds.
+
+Output ONLY valid JSON:
+{{"hooks": [{{"clip": <id>, "start": <exact timestamp of the line>, "line": "first 5 words of it", "why": "under 8 words"}}]}}
+
+CLIPS:
+{chr(10).join(blocks)}"""
+
+        raw = providers.chat(prompt, temperature=0.3, json_mode=True, log=log)
+        if not raw:
+            log.log(f"    hook batch {bi + 1}/{len(batches)}: no reply — using heuristic")
+            continue
+        try:
+            parsed = json.loads(raw)
+            rows = parsed.get("hooks", parsed) if isinstance(parsed, dict) else parsed
+        except (ValueError, TypeError) as e:
+            log.log(f"    hook batch {bi + 1}/{len(batches)}: unparseable JSON ({e})")
+            continue
+        if not isinstance(rows, list):
+            continue
+        got = 0
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            try:
+                cid = int(row.get("clip"))
+                hs = float(row.get("start"))
+            except (TypeError, ValueError):
+                continue
+            note = str(row.get("why", "") or "").strip()
+            line = str(row.get("line", "") or "").strip()
+            picks[cid] = (hs, f"{note}  “{line}…”" if line else note)
+            got += 1
+        log.log(f"    hook batch {bi + 1}/{len(batches)}: {got} pick(s)")
+
+    return picks
+
+
+def select_hooks(highlights: list, segments: list, log: DiagnosticLog,
+                 hook_len: float = HOOK_LEN_DEFAULT) -> int:
+    """Choose a `hook_len`-second cold open inside each clip, in place.
+
+    Writes `hook_start`, `hook_end` and `hook_text` onto every highlight that gets
+    one. Clips shorter than HOOK_MIN_CLIP_LEN are skipped. Returns how many hooks
+    were set.
+    """
+    log.section(f"HOOK-FIRST SELECTION ({hook_len:.0f}s cold open)")
+    if not highlights:
+        return 0
+
+    hook_len = max(1.0, min(float(hook_len), 10.0))
+
+    eligible, skipped = [], 0
+    for cid, h in enumerate(highlights):
+        if (h["end"] - h["start"]) < max(HOOK_MIN_CLIP_LEN, hook_len * 2.5):
+            skipped += 1
+            continue
+        eligible.append((cid, h))
+
+    if skipped:
+        log.log(f"  {skipped} clip(s) too short for a cold open "
+                f"(under {max(HOOK_MIN_CLIP_LEN, hook_len * 2.5):.0f}s) — left as-is")
+    if not eligible:
+        log.log("  No clip is long enough for a hook.")
+        return 0
+
+    picks = {}
+    if segments and providers.provider_status().get("chat_ready"):
+        log.log(f"  Asking the AI for the peak moment in {len(eligible)} clip(s)…")
+        picks = _ask_llm_for_hooks(eligible, segments, hook_len, log)
+    elif not segments:
+        log.log("  No transcript — using the payoff-zone heuristic for every clip.")
+    else:
+        log.log("  No chat provider — using the payoff-zone heuristic for every clip.")
+
+    made = 0
+    for cid, h in eligible:
+        why = ""
+        window = None
+
+        if cid in picks:
+            hs, why = picks[cid]
+            # The anchor only has to land inside the clip — _snap_hook grows it out
+            # to a whole line, so a timestamp near the end is still usable.
+            if h["start"] - 0.5 <= hs < h["end"]:
+                window = _snap_hook(hs, segments, h["start"], h["end"], hook_len)
+                if window is None:
+                    log.log(f"    Clip {cid + 1}: no complete line at {hs:.2f}s — using heuristic")
+                    why = ""
+            else:
+                log.log(f"    Clip {cid + 1}: AI hook {hs:.2f}s is outside "
+                        f"[{h['start']:.2f}, {h['end']:.2f}] — using heuristic")
+                why = ""
+
+        if window is None:
+            window = _hook_heuristic(h["start"], h["end"], segments, hook_len)
+        if window is None:
+            continue
+
+        h["hook_start"], h["hook_end"] = window
+        h["hook_text"] = _text_between(segments, *window) if segments else ""
+        made += 1
+        offset = h["hook_start"] - h["start"]
+        log.log(f"    Clip {cid + 1}: hook at +{offset:.1f}s into the clip "
+                f"({h['hook_start']:.2f}s–{h['hook_end']:.2f}s, "
+                f"{h['hook_end'] - h['hook_start']:.1f}s)"
+                f"{'  | ' + why if why else ''}")
+        if h.get("hook_text"):
+            log.log(f"              \"{h['hook_text'][:80]}\"")
+
+    log.log(f"\n  {made}/{len(highlights)} clip(s) will open with a "
+            f"{hook_len:.0f}s cold open.")
+    return made
+
+
+# ─────────────────────────────────────────────────────────────
 # Highlight Engine (entry point)
 # ─────────────────────────────────────────────────────────────
 
@@ -779,23 +1104,20 @@ def get_ai_highlights(transcript_path: str, job_dir: str, log: DiagnosticLog,
     log.log(f"  Target clips: {num_clips} ({'auto' if auto_mode else 'manual'}, max {max_for_video} = 1/min) | "
             f"AI picks first, coverage fills remainder")
 
-    # Per-clip length bounds.
-    #   "best" mode pins clips to a longer 40-60s window (the mode defines the length,
-    #   so it wins over any caller-sent bounds). "multi" uses the 20-40s default
-    #   (overridable via min_clip_len / max_clip_len).
-    if clip_mode == "best":
+    # Per-clip length bounds — the user picks these anywhere in 7s-1:30 via the UI
+    # slider, and whatever arrives is clamped into that range.
+    #
+    # "best" mode still leans longer, but ONLY when the caller never expressed a
+    # preference: an explicit request always wins, otherwise the mode would silently
+    # ignore the slider the user just moved.
+    asked_min = options.get("min_clip_len")
+    asked_max = options.get("max_clip_len")
+    untouched = (asked_min in (None, "", DEFAULT_MIN_CLIP_LEN)
+                 and asked_max in (None, "", DEFAULT_MAX_CLIP_LEN))
+    if clip_mode == "best" and untouched:
         min_len, max_len = 40.0, 60.0
     else:
-        try:
-            min_len = float(options.get("min_clip_len", DEFAULT_MIN_CLIP_LEN))
-        except (TypeError, ValueError):
-            min_len = DEFAULT_MIN_CLIP_LEN
-        try:
-            max_len = float(options.get("max_clip_len", DEFAULT_MAX_CLIP_LEN))
-        except (TypeError, ValueError):
-            max_len = DEFAULT_MAX_CLIP_LEN
-        if max_len <= min_len:
-            min_len, max_len = DEFAULT_MIN_CLIP_LEN, DEFAULT_MAX_CLIP_LEN
+        min_len, max_len = clamp_clip_bounds(asked_min, asked_max, log)
     log.log(f"  Clip length bounds: {min_len:.0f}s min / {max_len:.0f}s max")
 
     valid = []
@@ -805,7 +1127,8 @@ def get_ai_highlights(transcript_path: str, job_dir: str, log: DiagnosticLog,
         (len(segments) and sum(len(s.get('text','')) for s in segments) or 1) / SELECTION_CHUNK_CHARS))))
     clip_prompt = str(options.get("clip_prompt", "") or "").strip()
     raw_picks = select_highlights_chunked(segments, num_clips, per_chunk, log,
-                                          clip_prompt=clip_prompt)
+                                          clip_prompt=clip_prompt,
+                                          min_len=min_len, max_len=max_len)
 
     for h in raw_picks:
         try:
@@ -974,9 +1297,18 @@ def execute_selection_workflow(
     options.setdefault("clip_mode", "multi")
     # Free-text brief describing the clips the user wants ('' = no brief, pick generally).
     options.setdefault("clip_prompt", "")
-    # Clip-length bounds (used by "multi" mode; "best" mode pins 40-60s internally).
+    # Clip-length bounds. The user sets these anywhere in 7s-1:30; "best" mode only
+    # overrides them when the caller left both at the defaults.
     options.setdefault("min_clip_len", DEFAULT_MIN_CLIP_LEN)
     options.setdefault("max_clip_len", DEFAULT_MAX_CLIP_LEN)
+    # Hook-first: splice the clip's own peak moment onto the front as a cold open.
+    options.setdefault("hook_first", True)
+    options.setdefault("hook_len", HOOK_LEN_DEFAULT)
+    # Post-render passes (run in burn_subtitles once every clip is cut):
+    #   viral_council — 3 personas + judge rank the clips by predicted views
+    #   publish_kit   — titles, caption, hashtags and a posting guide per clip
+    options.setdefault("viral_council", True)
+    options.setdefault("publish_kit", True)
     # Subtitle/caption preferences — these don't affect selection, but we persist
     # them into the manifest so the burn stage (burn_subtitles.py) can read them.
     options.setdefault("burn_subtitles", True)
@@ -998,6 +1330,12 @@ def execute_selection_workflow(
     options.setdefault("caption_xy", None)
     options.setdefault("title_xy", None)
     options.setdefault("part_xy", None)
+    # Logo / watermark PNG. logo_path is an absolute path on this machine (the API
+    # resolves the uploaded filename before it gets here); '' means no watermark.
+    options.setdefault("logo_path", "")
+    options.setdefault("logo_scale", 0.18)      # share of frame width
+    options.setdefault("logo_xy", None)         # {"x":0..1,"y":0..1}, centre-anchored
+    options.setdefault("logo_opacity", 1.0)
     log.log(f"   Options  : {options}")
 
     raw_clips = []
@@ -1108,6 +1446,26 @@ def execute_selection_workflow(
                 with open(os.path.join(job_dir, "highlights.json"), "w", encoding="utf-8") as f:
                     json.dump(highlights, f, indent=4, ensure_ascii=False)
 
+        # ── STAGE 3b: pick each clip's 3-second cold open ────────────────────
+        # Skipped in sequential mode on purpose: parts promise gapless, in-order
+        # coverage of the source, and splicing a replayed peak onto the front of
+        # "Part 3" would break exactly that promise.
+        hooks_made = 0
+        if options.get("hook_first", True) and not sequential and highlights:
+            if status_callback:
+                status_callback("Finding each clip's 3-second hook...")
+            hook_segments = []
+            if transcript_path:
+                try:
+                    with open(transcript_path, "r", encoding="utf-8") as f:
+                        hook_segments = json.load(f).get("segments", [])
+                except (OSError, ValueError) as e:
+                    log.error(f"Could not re-read transcript for hook selection: {e}")
+            hooks_made = select_hooks(highlights, hook_segments, log,
+                                      hook_len=options.get("hook_len", HOOK_LEN_DEFAULT))
+            with open(os.path.join(job_dir, "highlights.json"), "w", encoding="utf-8") as f:
+                json.dump(highlights, f, indent=4, ensure_ascii=False)
+
         # NOTE: We do NOT cut raw clips anymore. The burn stage seeks into the source
         # video directly (-ss/-to) and cuts + scales + burns in a single ffmpeg pass,
         # which removes an entire encode/IO round-trip per clip.
@@ -1122,6 +1480,11 @@ def execute_selection_workflow(
             # highlight clips, which have no meaningful running order.
             "part": h.get("part"),
             "part_label": h.get("part_label", ""),
+            # Hook-first: absolute source times of the peak moment replayed as the
+            # cold open. Absent when this clip did not get one.
+            "hook_start": h.get("hook_start"),
+            "hook_end": h.get("hook_end"),
+            "hook_text": h.get("hook_text", ""),
         } for i, h in enumerate(highlights)]
         raw_clips = clip_entries
 
@@ -1137,6 +1500,13 @@ def execute_selection_workflow(
             "has_transcript": bool(transcript_path),
             "clip_mode": options.get("clip_mode", "multi"),
             "sequential": sequential,
+            # Hook-first cold open: how many clips got one, and how long it is.
+            "hook_first": bool(options.get("hook_first", True)) and not sequential,
+            "hook_len": float(options.get("hook_len", HOOK_LEN_DEFAULT)),
+            "hooks_made": hooks_made,
+            # Post-render extras the burn stage runs once all clips are cut.
+            "viral_council": bool(options.get("viral_council", True)),
+            "publish_kit": bool(options.get("publish_kit", True)),
             # Caption/subtitle preferences chosen by the client, read by burn_subtitles.py.
             "subtitle_options": {
                 "burn_subtitles":    options.get("burn_subtitles", True),
@@ -1157,6 +1527,11 @@ def execute_selection_workflow(
                 "caption_xy":        options.get("caption_xy"),
                 "title_xy":          options.get("title_xy"),
                 "part_xy":           options.get("part_xy"),
+                # Watermark PNG composited above the captions on every clip.
+                "logo_path":         options.get("logo_path", ""),
+                "logo_scale":        options.get("logo_scale", 0.18),
+                "logo_xy":           options.get("logo_xy"),
+                "logo_opacity":      options.get("logo_opacity", 1.0),
             },
             "clips": clip_entries,
         }

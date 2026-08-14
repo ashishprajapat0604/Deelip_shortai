@@ -10,6 +10,8 @@ import datetime
 import subprocess
 import argparse
 import providers
+import viral_council
+import publish_kit
 
 # ─────────────────────────────────────────────────────────────
 # Diagnostic Logger
@@ -135,6 +137,58 @@ def _slice_transcript(full_transcript_path: str, clip_start: float, clip_end: fl
             "words": words_in,
         })
     return {"segments": result_segments}
+
+
+def _shift_segment(seg: dict, delta: float, lo: float = None, hi: float = None) -> dict:
+    """Copy a segment with every timestamp moved by `delta`, optionally clamped into
+    [lo, hi]. Text fields (Devanagari, English, Hinglish) are carried across
+    untouched, so this is safe to run after the translation passes."""
+    def _t(value):
+        v = float(value or 0.0) + delta
+        if lo is not None:
+            v = max(lo, v)
+        if hi is not None:
+            v = min(hi, v)
+        return round(v, 3)
+
+    out = {k: v for k, v in seg.items() if k not in ("start", "end", "words")}
+    out["start"] = _t(seg.get("start", 0))
+    out["end"] = _t(seg.get("end", 0))
+    out["words"] = [dict(w, start=_t(w.get("start", 0)), end=_t(w.get("end", 0)))
+                    for w in seg.get("words", [])]
+    return out
+
+
+def _remap_segments_for_hook(segments: list, hook_start: float, hook_end: float) -> list:
+    """Rebuild a clip's captions for the HOOK-FIRST timeline.
+
+    The rendered video is [3s hook][full clip], so the caption timeline becomes:
+        0 … hook_len             the hook's own words, pulled back to start at 0
+        hook_len … hook_len+dur  the whole clip, pushed back by hook_len
+
+    Everything downstream (word timings, karaoke, cue chunking) is purely
+    time-based, so remapping the segments here is all that hook support costs: the
+    ASS builder is handed one continuous list and never learns a hook exists.
+
+    `hook_start` / `hook_end` are CLIP-LOCAL seconds.
+    """
+    hook_len = float(hook_end) - float(hook_start)
+    if hook_len <= 0 or not segments:
+        return segments
+
+    hooked = []
+    for seg in segments:
+        s, e = float(seg.get("start", 0)), float(seg.get("end", 0))
+        if e <= hook_start or s >= hook_end:
+            continue
+        new = _shift_segment(seg, -hook_start, lo=0.0, hi=hook_len)
+        # Words outside the window all clamp onto the boundary; without this they
+        # pile up as a stack of zero-length cues on the first or last frame.
+        new["words"] = [w for w in new["words"] if w["end"] > w["start"]]
+        if new["end"] > new["start"]:
+            hooked.append(new)
+
+    return hooked + [_shift_segment(seg, hook_len) for seg in segments]
 
 
 def transcribe_clip(audio_path: str, job_dir: str, clip_index: int, log: DiagnosticLog,
@@ -414,6 +468,22 @@ def _fmt_ass_time(seconds: float) -> str:
     return f"{h:d}:{m:02d}:{s:02d}.{cs:02d}"
 
 
+def _headline_text(title: str) -> str:
+    """Render the on-screen headline for ASS.
+
+    Two-line meme titles ("bro: you're lucky" / "me: *my luck*") are the reason this
+    is not just .upper(): the format depends on BOTH the line break and the lowercase
+    voice, and shouting it in caps kills the joke. So a multi-line title keeps its
+    own case and gets a real ASS line break; a single-line headline is still
+    uppercased, which is what reads best as a big overlay."""
+    lines = [ln.strip() for ln in str(title or "").splitlines() if ln.strip()]
+    if not lines:
+        return ""
+    if len(lines) == 1:
+        return _ass_escape(lines[0].upper())
+    return "\\N".join(_ass_escape(ln) for ln in lines)
+
+
 def _ass_escape(text: str) -> str:
     return (text or "").replace("\\", "\\\\").replace("{", "(").replace("}", ")").replace("\n", " ").strip()
 
@@ -615,6 +685,10 @@ _WHITE_BOX_BACK = "&H80FFFFFF"  # 50% white / 50% transparent slab (white_box st
 _ORANGE      = "&H0000A5FF"   # RGB FF A5 00 — vibrant orange (fire)
 _DARK_RED    = "&H000000CC"   # RGB CC 00 00 — deep red (fire outline)
 _MAGENTA_BOX = "&HA0FF00FF"   # 63% opaque magenta slab (retro box)
+_MINT        = "&H00C5F5C0"   # RGB C0 F5 C5 — soft mint green (mint)
+_DEEP_BACK   = "&HB0201810"   # 69% opaque near-black slab (mint)
+_HOT_PINK    = "&H009B4BFF"   # RGB FF 4B 9B — hot pink (sunset)
+_DEEP_PURPLE = "&H00701A3A"   # RGB 3A 1A 70 — deep purple outline (sunset)
 
 # One reusable Style-row tail. Order matches the Format line below.
 _STYLE_FIELDS = "1,0,0,0,100,100,0,0,{bs},{ol},{sh},{al},{ml},{mr},{mv},1"
@@ -678,14 +752,70 @@ def _style_preset(name: str, accent: str = _DEFAULT_ACCENT) -> dict:
     elif name == "fade":
         # Standard outline but each cue fades in and out smoothly
         p.update(fontsize=60, outline=5, anim="fade")
+    elif name == "word_pop":
+        # ONE word at a time, scaling in — the fast-cut Reels/TikTok look.
+        p.update(fontsize=76, outline=6, upper=True, anim="word_pop")
+    elif name == "mint":
+        # Soft mint text on a deep slab — calmer, good over busy footage.
+        p.update(fontsize=60, primary=_MINT, border=3, outline=7, shadow=0,
+                 back=_DEEP_BACK, outline_colour=_DEEP_BACK)
+    elif name == "sunset":
+        # Warm gradient-feel: hot pink text with a deep purple outline.
+        p.update(fontsize=66, primary=_HOT_PINK, outline_colour=_DEEP_PURPLE,
+                 outline=6, shadow=2, upper=True, back=_BLACK)
+    elif name == "mono":
+        # Small, tight, all-caps on a black bar — documentary / subtitle-track look.
+        p.update(fontsize=48, primary=_WHITE, border=3, outline=5, shadow=0,
+                 back=_BOX_BACK, outline_colour=_BOX_BACK, upper=True)
+    elif name == "ransom":
+        # Yellow on black slab, uppercase — the loud "MrBeast" caption.
+        p.update(fontsize=70, primary=_YELLOW, border=3, outline=7, shadow=0,
+                 back=_BOX_BACK, outline_colour=_BOX_BACK, upper=True)
     # "outline" == the default base
     return p
 
 
+# What the UI shows for each style: a label and a one-line description. Kept next
+# to the presets so a new style is added in exactly two places, not five.
+CAPTION_STYLE_INFO = {
+    "outline":     ("Outline",     "White text with a clean black edge. Reads on anything."),
+    "box":         ("Dark box",    "White text on a translucent black slab."),
+    "white_box":   ("Light box",   "Dark text on a white slab. Good over dark footage."),
+    "bold_yellow": ("Bold yellow", "Big yellow caps. Loud and impossible to miss."),
+    "karaoke":     ("Karaoke",     "Each word lights up as it is spoken."),
+    "word_pop":    ("Word pop",    "One word at a time, scaling in. Fast-cut Reels look."),
+    "neon":        ("Neon",        "Cyan with a white stroke. High contrast, high energy."),
+    "retro":       ("Retro",       "White caps on a magenta slab. Classic TikTok."),
+    "shadow":      ("Cinematic",   "White text with a soft drop shadow. Filmic and quiet."),
+    "fire":        ("Fire",        "Orange caps with a deep red edge. Maximum energy."),
+    "fade":        ("Fade",        "Plain outline, each line fading gently in and out."),
+    "mint":        ("Mint",        "Soft mint on a deep slab. Calm over busy footage."),
+    "sunset":      ("Sunset",      "Hot pink caps with a purple edge."),
+    "mono":        ("Mono",        "Small tight caps on a black bar. Documentary style."),
+    "ransom":      ("Ransom",      "Huge yellow caps on black. The loudest option."),
+}
+
+
+def caption_style_catalogue() -> list:
+    """Style list for the UI, in display order, with which layouts each supports."""
+    return [{
+        "key": key,
+        "label": CAPTION_STYLE_INFO[key][0],
+        "help": CAPTION_STYLE_INFO[key][1],
+        "animated": key not in _STATIC_STYLES,
+        # Animated styles fall back to plain outline in the dual-track layout, so the
+        # UI can grey them out there instead of silently ignoring the choice.
+        "dual_ok": key in _STATIC_STYLES,
+    } for key in VALID_CAPTION_STYLES]
+
+
 # Styles that are static text (valid for the dual layout); animated ones fall back
 # to "outline" in dual since two animated tracks at once is visual noise.
-_STATIC_STYLES = ("outline", "box", "white_box", "bold_yellow", "neon", "retro", "shadow", "fire", "fade")
-VALID_CAPTION_STYLES = ("outline", "box", "white_box", "bold_yellow", "karaoke", "neon", "retro", "shadow", "fire", "fade")
+_STATIC_STYLES = ("outline", "box", "white_box", "bold_yellow", "neon", "retro",
+                  "shadow", "fire", "fade", "mint", "sunset", "mono", "ransom")
+VALID_CAPTION_STYLES = ("outline", "box", "white_box", "bold_yellow", "karaoke",
+                        "word_pop", "neon", "retro", "shadow", "fire", "fade",
+                        "mint", "sunset", "mono", "ransom")
 
 
 def _style_row(name: str, font: str, preset: dict, align: int, margin_v: int,
@@ -885,7 +1015,7 @@ def make_caption_ass(segments: list, ass_path: str,
                                       primary=_TITLE_COLOUR, fontsize=_TITLE_FONTSIZE))
             prefix = ""
         events.append(f"Dialogue: 0,{_fmt_ass_time(0)},{_fmt_ass_time(full_end)},TITLE,,0,0,0,,"
-                      f"{prefix}{_ass_escape(title.upper())}")
+                      f"{prefix}{_headline_text(title)}")
         return True
 
     def add_part_label():
@@ -936,7 +1066,7 @@ def make_caption_ass(segments: list, ass_path: str,
                                           primary=_TITLE_COLOUR, fontsize=_TITLE_FONTSIZE))
                 t_prefix = ""
             events.append(f"Dialogue: 0,{_fmt_ass_time(0)},{_fmt_ass_time(full_end)},TITLE,,0,0,0,,"
-                          f"{t_prefix}{_ass_escape(title.upper())}")
+                          f"{t_prefix}{_headline_text(title)}")
             has_title = True
         up = dpreset["upper"]
         for c_start, c_end, text in hi_cues:
@@ -962,6 +1092,8 @@ def make_caption_ass(segments: list, ass_path: str,
 
         if preset["anim"] == "karaoke":
             ev = _karaoke_events(segments, text_key, lead_offset, clip_duration, preset)
+        elif preset["anim"] == "word_pop":
+            ev = _wordpop_events(segments, text_key, lead_offset, clip_duration, preset)
         elif preset["anim"] == "fade":
             cues = _static_cues(segments, language, lead_offset, clip_duration)
             ev = [(s, e, f'{{\\fad(120,80)}}{_ass_escape(t.upper() if preset["upper"] else t)}')
@@ -1046,6 +1178,118 @@ def _build_render_filter(ass_path: str, fontsdir: str = "") -> str:
     return ",".join(chain)
 
 
+# ── Logo / watermark ──────────────────────────────────────────────────────────
+# A PNG the user uploads, scaled to a share of the frame width and pinned wherever
+# they dropped it. Drawn LAST so it sits above the captions, which is what a
+# watermark is for.
+
+LOGO_MIN_SCALE, LOGO_MAX_SCALE = 0.03, 0.60
+LOGO_DEFAULT_SCALE = 0.18
+LOGO_DEFAULT_XY = (0.84, 0.07)      # top-right, clear of the caption band
+
+
+def _norm_logo(cfg: dict) -> dict:
+    """Validate the logo settings, or return {} when there is no usable logo.
+
+    Returns {path, scale, x, y, opacity} with everything clamped, so the filter
+    builder can trust its input."""
+    path = str((cfg or {}).get("logo_path", "") or "").strip()
+    if not path or not os.path.isfile(path):
+        return {}
+
+    def _f(key, default, lo, hi):
+        try:
+            return max(lo, min(hi, float((cfg or {}).get(key, default))))
+        except (TypeError, ValueError):
+            return default
+
+    xy = _norm_xy((cfg or {}).get("logo_xy")) or LOGO_DEFAULT_XY
+    return {
+        "path": path,
+        "scale": _f("logo_scale", LOGO_DEFAULT_SCALE, LOGO_MIN_SCALE, LOGO_MAX_SCALE),
+        "x": xy[0],
+        "y": xy[1],
+        "opacity": _f("logo_opacity", 1.0, 0.05, 1.0),
+    }
+
+
+def _logo_graph(logo: dict, src_label: str, out_label: str) -> str:
+    """Scale the logo to `scale` x frame width (height auto, aspect kept) and pin its
+    CENTRE at (x, y) as fractions of the 1080x1920 frame — the same coordinate space
+    the drag-and-drop editor uses for the other overlays."""
+    width = max(1, int(round(SHORTS_W * logo["scale"])))
+    # force_original_aspect_ratio is not needed with -1 height, but rounding to even
+    # keeps yuv420p happy if the logo is ever re-encoded rather than composited.
+    steps = [f"scale={width}:-2:flags=bicubic", "format=rgba"]
+    if logo["opacity"] < 0.999:
+        steps.append(f"colorchannelmixer=aa={logo['opacity']:.3f}")
+    x = f"{SHORTS_W}*{logo['x']:.4f}-overlay_w/2"
+    y = f"{SHORTS_H}*{logo['y']:.4f}-overlay_h/2"
+    return (f"[1:v]{','.join(steps)}[lg];"
+            f"[{src_label}][lg]overlay=x='{x}':y='{y}':format=auto[{out_label}]")
+
+
+def _build_hook_filter_complex(vf_chain: str, hook_start: float, hook_end: float) -> tuple:
+    """filter_complex for a hook-first render: [hook] then [full clip], concatenated,
+    then scaled to 9:16 and captioned in the SAME single pass.
+
+    `hook_start` / `hook_end` are CLIP-LOCAL seconds — the caller input-seeks the
+    source with -ss/-to first, so this graph's timeline already starts at the clip's
+    own zero. `setpts=PTS-STARTPTS` runs before the split anyway, so the trim below
+    measures from zero no matter what timestamps the seek left behind.
+
+    Returns (filter_complex, video_label, audio_label).
+    """
+    hs, he = float(hook_start), float(hook_end)
+    graph = (
+        "[0:v]setpts=PTS-STARTPTS,split=2[vh][vb];"
+        "[0:a]asetpts=PTS-STARTPTS,asplit=2[ah][ab];"
+        f"[vh]trim=start={hs:.3f}:end={he:.3f},setpts=PTS-STARTPTS[hv];"
+        f"[ah]atrim=start={hs:.3f}:end={he:.3f},asetpts=PTS-STARTPTS[ha];"
+        "[vb]setpts=PTS-STARTPTS[bv];"
+        "[ab]asetpts=PTS-STARTPTS[ba];"
+        "[hv][ha][bv][ba]concat=n=2:v=1:a=1[cv][ca];"
+        f"[cv]{vf_chain}[vout]"
+    )
+    return graph, "[vout]", "[ca]"
+
+
+def _filter_args(vf_chain: str, hook_local, logo: dict) -> list:
+    """The ffmpeg arguments that turn the decoded input(s) into the finished frame.
+
+    Four shapes, cheapest first — a plain -vf is kept whenever nothing else is
+    needed, so the common path never pays for a filter graph it does not use:
+
+        no hook, no logo   -vf <chain>
+        hook, no logo      concat the cold open, then <chain>
+        no hook, logo      <chain>, then composite the PNG on top
+        hook + logo        concat, then <chain>, then composite
+
+    The logo is always last so it sits above the captions.
+    """
+    if not hook_local and not logo:
+        return ["-vf", vf_chain]
+
+    parts, vlabel, alabel = [], None, None
+
+    if hook_local:
+        graph, vlabel, alabel = _build_hook_filter_complex(
+            vf_chain, hook_local[0], hook_local[1])
+        parts.append(graph)
+    else:
+        parts.append(f"[0:v]{vf_chain}[base]")
+        # "0:a?" — optional, so a silent source renders video-only instead of
+        # failing the whole clip. The hook path cannot do this: its concat needs a
+        # real audio stream, which is why dropping the hook is a ladder rung.
+        vlabel, alabel = "[base]", "0:a?"
+
+    if logo:
+        parts.append(_logo_graph(logo, vlabel.strip("[]"), "vlogo"))
+        vlabel = "[vlogo]"
+
+    return ["-filter_complex", ";".join(parts), "-map", vlabel, "-map", alabel]
+
+
 # ─────────────────────────────────────────────────────────────
 # Fonts
 # ─────────────────────────────────────────────────────────────
@@ -1115,6 +1359,8 @@ HINDI_FONTS = {
     "baloo":    ("Baloo 2",              "Baloo2-Bold.ttf"),
     "laila":    ("Laila",                "Laila-Bold.ttf"),
     "rajdhani": ("Rajdhani",             "Rajdhani-Bold.ttf"),
+    "khand":    ("Khand",                "Khand-Bold.ttf"),
+    "teko":     ("Teko",                 "Teko-Bold.ttf"),
 }
 ENGLISH_FONTS = {
     "poppins":     ("Poppins",            "Poppins-Bold.ttf"),
@@ -1130,6 +1376,16 @@ ENGLISH_FONTS = {
 }
 VALID_HINDI_FONTS = tuple(HINDI_FONTS.keys())
 VALID_ENGLISH_FONTS = tuple(ENGLISH_FONTS.keys())
+
+
+def available_fonts(table: dict) -> dict:
+    """The subset of `table` whose .ttf is actually on disk.
+
+    Offering a font the renderer cannot load is worse than not offering it: the
+    preview shows one typeface and libass silently substitutes another. The UI is
+    built from this, so a font that failed to download is never selectable."""
+    return {k: v for k, v in table.items()
+            if os.path.isfile(os.path.join(BASE_DIR, "fonts", v[1]))}
 
 
 def _font_from_choice(choice, table, fallback_resolver):
@@ -1190,7 +1446,10 @@ def burn_subtitles_for_clip(raw_path: str, clip_index: int, job_dir: str, clips_
                              show_part_label: bool = False,
                              caption_xy=None,
                              title_xy=None,
-                             part_xy=None) -> str:
+                             part_xy=None,
+                             hook_start: float = None,
+                             hook_end: float = None,
+                             logo: dict = None) -> str:
     """Renders ONE finished 9:16 Short in a single ffmpeg pass.
 
     `raw_path` is the SOURCE video; we seek into it with -ss/-to instead of cutting a
@@ -1201,6 +1460,10 @@ def burn_subtitles_for_clip(raw_path: str, clip_index: int, job_dir: str, clips_
     layout="dual"        -> Devanagari Hindi top + English bottom (classic look).
     caption_style        -> "outline" (text + outline) or "box" (solid background).
     show_title           -> add the static AI headline overlay.
+    hook_start/hook_end  -> ABSOLUTE source times of a peak moment inside this clip.
+                            When given, that window is spliced onto the FRONT as a
+                            cold open and the clip then plays in full, so the peak
+                            is seen twice. Captions are remapped to match.
     """
     # Sequential parts are named part_1.mp4, part_2.mp4 … so the running order is
     # obvious in the file manager and when uploading a series.
@@ -1220,11 +1483,44 @@ def burn_subtitles_for_clip(raw_path: str, clip_index: int, job_dir: str, clips_
         log.log(f"     FAILED - source video does not exist")
         return None
 
-    ass_path = None
+    # Every ASS written for this clip, so the finally block can clean up both the
+    # hooked and un-hooked versions when the ladder had to rebuild.
+    ass_paths = []
+    _rebuild_vf_without_hook = None
 
     try:
         clip_duration = (clip_end - clip_start) if (clip_start is not None and clip_end is not None) else None
         vf = None
+
+        # ── Hook-first: convert the absolute hook window to clip-local seconds ──
+        # The render input-seeks to clip_start, so everything past this point works
+        # in clip-local time. An unusable window (outside the clip, or too short to
+        # register) simply disables the hook for this clip rather than failing it.
+        hook_local = None
+        if (hook_start is not None and hook_end is not None
+                and clip_start is not None and clip_end is not None and clip_duration):
+            hs = max(0.0, min(float(hook_start) - clip_start, clip_duration))
+            he = max(0.0, min(float(hook_end) - clip_start, clip_duration))
+            if he - hs >= 0.5:
+                hook_local = (hs, he)
+            else:
+                log.log(f"     Hook window {hs:.2f}–{he:.2f}s is unusable — no cold open.")
+
+        # Watermark PNG, already validated and clamped by the caller.
+        logo_cfg = logo or {}
+        if logo_cfg:
+            log.log(f"     Logo   : {os.path.basename(logo_cfg['path'])} at "
+                    f"{logo_cfg['scale']*100:.0f}% width, "
+                    f"({logo_cfg['x']:.2f}, {logo_cfg['y']:.2f}), "
+                    f"opacity {logo_cfg['opacity']:.2f}")
+
+        hook_len = (hook_local[1] - hook_local[0]) if hook_local else 0.0
+        # Captions and the title overlay must span the CONCATENATED timeline, which is
+        # longer than the clip by exactly the hook.
+        render_duration = (clip_duration + hook_len) if clip_duration is not None else None
+        if hook_local:
+            log.log(f"     Hook   : {hook_len:.1f}s cold open from +{hook_local[0]:.1f}s "
+                    f"(final length {render_duration:.1f}s)")
 
         # The part badge and a fixed series title are independent of captions: a
         # sequential job with subtitles OFF still needs "Part 3" burned on. So the
@@ -1248,6 +1544,7 @@ def burn_subtitles_for_clip(raw_path: str, clip_index: int, job_dir: str, clips_
                 dir=job_dir, prefix=f"clip{clip_index}_", encoding="utf-8"
             ) as tmp:
                 ass_path = tmp.name
+            ass_paths.append(ass_path)
             primary, secondary, has_title = make_caption_ass(
                 [], ass_path,
                 layout="single", language="english", position=position,
@@ -1255,7 +1552,7 @@ def burn_subtitles_for_clip(raw_path: str, clip_index: int, job_dir: str, clips_
                 title=title, show_title=show_title,
                 hindi_font="Noto Sans Devanagari",
                 latin_font=_la_family or "Poppins",
-                clip_duration=clip_duration,
+                clip_duration=render_duration,
                 video_box=_video_box(*(src_dims if src_dims and src_dims[0]
                                        else _probe_dimensions(raw_path, log))),
                 part_label=part_label, show_part_label=show_part_label,
@@ -1268,6 +1565,13 @@ def burn_subtitles_for_clip(raw_path: str, clip_index: int, job_dir: str, clips_
                 data = transcribe_clip(None, job_dir, clip_index, log,
                                        clip_start=clip_start, clip_end=clip_end, translate=True)
                 segments = data.get("segments", [])
+
+            # Hook-first: fold the replayed peak into the caption timeline. Done after
+            # transcription/translation so every language field comes along for free.
+            # The original list is kept for the ladder rung that drops the hook.
+            base_segments = segments or []
+            if hook_local and segments:
+                segments = _remap_segments_for_hook(segments, hook_local[0], hook_local[1])
 
             # 2. Resolve fonts. Hindi (Devanagari) is the one that breaks if missing.
             need_hindi = (layout == "dual") or (layout == "single" and language == "hindi")
@@ -1291,19 +1595,11 @@ def burn_subtitles_for_clip(raw_path: str, clip_index: int, job_dir: str, clips_
             fontsdir = _prepare_fontsdir(wanted_paths, job_dir)
 
             # 3. Build the ASS for the chosen layout/language/position/style.
-            #    Write it inside the job dir (always exists, cross-platform) rather than
-            #    a hardcoded "/tmp" — "/tmp" doesn't exist on Windows.
-            with tempfile.NamedTemporaryFile(
-                mode="w", suffix=".ass", delete=False,
-                dir=job_dir, prefix=f"clip{clip_index}_", encoding="utf-8"
-            ) as tmp:
-                ass_path = tmp.name
-
-            # Figure out where the actual video band sits inside the 9:16 frame, so
-            # "bottom"/"top" captions can pin to the edge of the footage (just below /
-            # above it) rather than the very frame edge.
-            # All clips seek into the SAME source video, so its dimensions are probed
-            # once by the caller and passed in — avoids an ffprobe spawn per clip.
+            #    Figure out where the actual video band sits inside the 9:16 frame, so
+            #    "bottom"/"top" captions can pin to the edge of the footage (just below /
+            #    above it) rather than the very frame edge.
+            #    All clips seek into the SAME source video, so its dimensions are probed
+            #    once by the caller and passed in — avoids an ffprobe spawn per clip.
             if src_dims and src_dims[0] and src_dims[1]:
                 src_w, src_h = src_dims
             else:
@@ -1313,44 +1609,70 @@ def burn_subtitles_for_clip(raw_path: str, clip_index: int, job_dir: str, clips_
                 log.log(f"     Video band: y {vbox[0]:.0f}–{vbox[1]:.0f} of {SHORTS_H} "
                         f"(src {src_w}x{src_h})")
 
-            primary, secondary, has_title = make_caption_ass(
-                segments, ass_path,
-                layout=layout,
-                language=language,
-                position=position,
-                caption_style=caption_style,
-                accent_color=accent_color,
-                title=title,
-                show_title=show_title,
-                hindi_font=hindi_family,
-                latin_font=latin_family,
-                clip_duration=clip_duration,
-                video_box=vbox,
-                part_label=part_label,
-                show_part_label=show_part_label,
-                caption_xy=caption_xy,
-                title_xy=title_xy,
-                part_xy=part_xy,
-            )
-            log.log(f"     Tracks : {primary} primary cues / {secondary} secondary cues / "
-                    f"title={'yes' if has_title else 'no'} (fontsdir={fontsdir or 'system'})")
+            def _make_vf(segs, duration, tag=""):
+                """Write an ASS for `segs` on a `duration`-long timeline and return the
+                -vf chain that burns it. Called twice when the hook has to be dropped
+                mid-ladder: the caption timeline differs between the two, so the file
+                is rebuilt rather than reused at the wrong offset.
 
-            if primary == 0 and secondary == 0 and not has_title:
-                log.log("     WARNING: nothing to overlay - rendering plain 9:16 video.")
-                vf = _build_render_filter("", "")
-            else:
-                vf = _build_render_filter(ass_path, fontsdir)
+                Written inside the job dir (always exists, cross-platform) rather than
+                a hardcoded "/tmp" — "/tmp" doesn't exist on Windows."""
+                with tempfile.NamedTemporaryFile(
+                    mode="w", suffix=".ass", delete=False,
+                    dir=job_dir, prefix=f"clip{clip_index}_{tag}", encoding="utf-8"
+                ) as tmp_ass:
+                    path = tmp_ass.name
+                ass_paths.append(path)
+
+                primary, secondary, has_title = make_caption_ass(
+                    segs, path,
+                    layout=layout,
+                    language=language,
+                    position=position,
+                    caption_style=caption_style,
+                    accent_color=accent_color,
+                    title=title,
+                    show_title=show_title,
+                    hindi_font=hindi_family,
+                    latin_font=latin_family,
+                    clip_duration=duration,
+                    video_box=vbox,
+                    part_label=part_label,
+                    show_part_label=show_part_label,
+                    caption_xy=caption_xy,
+                    title_xy=title_xy,
+                    part_xy=part_xy,
+                )
+                log.log(f"     Tracks : {primary} primary cues / {secondary} secondary cues / "
+                        f"title={'yes' if has_title else 'no'} (fontsdir={fontsdir or 'system'})")
+                if primary == 0 and secondary == 0 and not has_title:
+                    log.log("     WARNING: nothing to overlay - rendering plain 9:16 video.")
+                    return _build_render_filter("", "")
+                return _build_render_filter(path, fontsdir)
+
+            vf = _make_vf(segments, render_duration)
+            if hook_local:
+                # Rung 3 of the ladder drops the hook; its captions must lose the
+                # offset too, so keep a builder for the un-hooked timeline.
+                _rebuild_vf_without_hook = lambda: _make_vf(
+                    base_segments, clip_duration, tag="nohook_")
 
         # 4. SINGLE ffmpeg pass: seek into source (-ss/-to) + scale to 9:16 + (burn).
         # Input-seek BEFORE -i is fast (keyframe seek); we re-encode anyway so accuracy
         # is preserved by -to being applied on the trimmed input.
-        def _build_cmd(venc_args, filter_chain):
+        def _build_cmd(venc_args, filter_chain, use_hook, use_logo=True):
             cmd = ["ffmpeg", "-y"]
             if clip_start is not None and clip_end is not None:
                 cmd += ["-ss", f"{clip_start:.3f}", "-to", f"{clip_end:.3f}"]
-            cmd += ["-i", raw_path, "-vf", filter_chain]
+            cmd += ["-i", raw_path]
+            lg = logo_cfg if use_logo else None
+            if lg:
+                # -loop 1 so a still PNG covers the whole clip rather than one frame.
+                cmd += ["-loop", "1", "-i", lg["path"]]
+            cmd += _filter_args(filter_chain, hook_local if use_hook else None, lg)
             cmd += venc_args
-            cmd += ["-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", final_output]
+            cmd += ["-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
+                    "-shortest", final_output]
             return cmd
 
         # Pick the fastest available encoder (NVENC -> AMF -> QSV -> libx264).
@@ -1358,19 +1680,42 @@ def burn_subtitles_for_clip(raw_path: str, clip_index: int, job_dir: str, clips_
 
         # Render fallback ladder — each rung drops one thing that can fail, so a clip is
         # only lost if even a plain CPU re-encode with no captions fails:
-        #   1. chosen encoder + captions
-        #   2. CPU encoder + captions   (GPU driver / session-limit failures)
-        #   3. CPU encoder, NO captions (broken ASS, missing font, libass error)
+        #   1. chosen encoder + captions + hook
+        #   2. CPU encoder + captions + hook  (GPU driver / session-limit failures)
+        #   3. CPU encoder + captions, NO hook (silent source: [0:a] has nothing to
+        #      split, so the concat graph errors out — the clip itself is still fine)
+        #   4. CPU encoder, NO captions, NO hook (broken ASS, missing font, libass error)
+        #
+        # Captions are remapped for the hooked timeline, so dropping the hook at rung 3
+        # shifts them; they are rebuilt without the offset there rather than left adrift.
         plain_vf = _build_render_filter("", "")
-        ladder = [(venc_args, enc_name, vf, "captions")]
+        has_logo = bool(logo_cfg)
+        base = "captions + hook" if hook_local else "captions"
+        if has_logo:
+            base += " + logo"
+        ladder = [(venc_args, enc_name, vf, True, True, base)]
         if enc_name != "cpu":
-            ladder.append((providers.CPU_ENCODER_ARGS, "cpu", vf, "captions"))
+            ladder.append((providers.CPU_ENCODER_ARGS, "cpu", vf, True, True, base))
+        if hook_local:
+            ladder.append((providers.CPU_ENCODER_ARGS, "cpu", None, False, True,
+                           "captions, NO hook"))
+        if has_logo:
+            ladder.append((providers.CPU_ENCODER_ARGS, "cpu", None, False, False,
+                           "captions, NO hook, NO logo"))
         if vf != plain_vf:
-            ladder.append((providers.CPU_ENCODER_ARGS, "cpu", plain_vf, "NO captions"))
+            ladder.append((providers.CPU_ENCODER_ARGS, "cpu", plain_vf, False, False,
+                           "NO captions"))
 
         result = None
-        for enc_args, name, filter_chain, what in ladder:
-            command = _build_cmd(enc_args, filter_chain)
+        for enc_args, name, filter_chain, use_hook, use_logo, what in ladder:
+            if filter_chain is None:
+                # Rungs that drop the hook need captions rebuilt without its offset.
+                # Overlay-only renders have no rebuild fn: their ASS is a single
+                # full-length static cue, so the hook offset never applied to it and
+                # the original chain is still correct.
+                filter_chain = (_rebuild_vf_without_hook() if _rebuild_vf_without_hook
+                                else vf)
+            command = _build_cmd(enc_args, filter_chain, use_hook, use_logo)
             log.log(f"     FFmpeg ({name}, {what})")
             result = providers.run_cmd(command, timeout=RENDER_TIMEOUT, retries=1,
                                        log=log, label=f"ffmpeg-{name}")
@@ -1400,8 +1745,8 @@ def burn_subtitles_for_clip(raw_path: str, clip_index: int, job_dir: str, clips_
         return None
 
     finally:
-        if ass_path:
-            try: os.unlink(ass_path)
+        for path in ass_paths:
+            try: os.unlink(path)
             except OSError: pass
 
 
@@ -1490,10 +1835,26 @@ def execute_subtitle_workflow(
         if english_font_choice and english_font_choice not in VALID_ENGLISH_FONTS:
             english_font_choice = ""
 
+        # Post-selection features, all driven from the manifest so the CLI entry point
+        # gets them too.
+        hook_first = bool(manifest.get("hook_first", False))
+        want_council = bool(manifest.get("viral_council", True))
+        want_kit = bool(manifest.get("publish_kit", True))
+        hooked_clips = sum(1 for rc in raw_clips
+                           if rc.get("hook_start") is not None) if hook_first else 0
+        # Validated once for the whole job — every clip shares the same watermark.
+        logo_cfg = _norm_logo(cfg)
+        if cfg.get("logo_path") and not logo_cfg:
+            log.log(f"   WARNING: logo '{cfg.get('logo_path')}' is missing on disk — "
+                    f"rendering without a watermark.")
+
         log.section("CAPTION CONFIG")
         log.log(f"   burn={burn} | layout={layout} | language={language} | position={position} | "
                 f"style={caption_style} | accent={accent_color or 'default'} | title={show_title}")
         log.log(f"   fonts: hindi={hindi_font_choice or 'auto'} | english={english_font_choice or 'auto'}")
+        log.log(f"   hook-first={hook_first} ({hooked_clips}/{len(raw_clips)} clips) | "
+                f"council={want_council} | publish kit={want_kit} | "
+                f"logo={'yes' if logo_cfg else 'no'}")
 
         clip_segments = {}   # index -> segments list
         clip_titles = {}     # index -> title string
@@ -1596,7 +1957,11 @@ def execute_subtitle_workflow(
                     language = "hindi"
             # A fixed series title is used verbatim on every clip, so there is
             # nothing for the AI title pass to do — skip the extra LLM call.
-            if show_title and not series_title:
+            # The publish kit (STAGE 4b) writes its headline against the same brief as
+            # the caption and hashtags, so when it is enabled its title wins and this
+            # older single-purpose pass is skipped — otherwise it is two LLM calls for
+            # one overlay.
+            if show_title and not series_title and not want_kit:
                 titles = batch_generate_titles(all_segment_lists, log)
                 clip_titles = {order[i]: titles[i] for i in range(len(order))}
             elif series_title:
@@ -1622,6 +1987,60 @@ def execute_subtitle_workflow(
                         tf.write("\n")
             except Exception as e:
                 log.error(f"Could not write combined transcript file: {e}", e)
+
+        # ── STAGE 4b: viral council + publish kit ────────────────────────────
+        # Both read each clip's words. When captions are on, STAGE 4 already
+        # transcribed every clip; when they are off there is nothing in
+        # clip_segments, so the full-video transcript is sliced instead and these
+        # features keep working on a captionless job.
+        council_verdicts, kits = [], {}
+        if want_council or want_kit:
+            whisper_full = os.path.join(job_dir, "transcript_full.json")
+            briefs = []
+            for rc in raw_clips:
+                idx = rc["index"]
+                segs = clip_segments.get(idx) or []
+                if (not segs and os.path.exists(whisper_full)
+                        and rc.get("start") is not None and rc.get("end") is not None):
+                    try:
+                        segs = _slice_transcript(whisper_full, rc["start"],
+                                                 rc["end"]).get("segments", [])
+                    except (OSError, ValueError) as e:
+                        log.log(f"   Clip {idx}: could not slice transcript for analysis ({e})")
+                        segs = []
+                texts = [(s.get("text") or "").strip() for s in segs]
+                briefs.append({
+                    "index": idx,
+                    "duration": round(float(rc.get("end") or 0) - float(rc.get("start") or 0), 2),
+                    "score": rc.get("score", 0),
+                    "opening": " ".join(texts[:2]).strip(),
+                    "transcript": " ".join(texts).strip(),
+                    "hook_text": rc.get("hook_text", ""),
+                })
+
+            if want_council:
+                if status_callback:
+                    status_callback("AI council is ranking clips by view potential...")
+                try:
+                    council_verdicts = viral_council.convene(briefs, log)
+                except Exception as e:
+                    # Ranking is a bonus on top of the clips — never lose a finished
+                    # render because the council choked.
+                    log.error(f"Viral council failed (clips are unaffected): {e}", e)
+
+            if want_kit:
+                if status_callback:
+                    status_callback("Writing titles, captions and hashtags...")
+                try:
+                    kits = publish_kit.generate(briefs, log)
+                except Exception as e:
+                    log.error(f"Publish kit failed (clips are unaffected): {e}", e)
+
+            # The kit's headline is the on-screen title, replacing the old title pass.
+            if show_title and not series_title and kits:
+                for idx, kit in kits.items():
+                    if kit.get("onscreen"):
+                        clip_titles[idx] = kit["onscreen"]
 
         # ── STAGE 5: parallel burn (single pass per clip, seek into source) ──
         log.section("STAGE 5 - PARALLEL RENDER (cut + scale + optional captions)")
@@ -1681,6 +2100,11 @@ def execute_subtitle_workflow(
                 caption_xy=caption_xy,
                 title_xy=title_xy,
                 part_xy=part_xy,
+                # Hook-first cold open, chosen during selection. None for clips that
+                # were too short for one, and for every sequential part.
+                hook_start=rc.get("hook_start") if hook_first else None,
+                hook_end=rc.get("hook_end") if hook_first else None,
+                logo=logo_cfg,
             )
             done_count["n"] += 1
             if status_callback:
@@ -1700,6 +2124,62 @@ def execute_subtitle_workflow(
             out = results.get(rc["index"])
             if out:
                 final_clips.append(out)
+
+        # ── Posting sheets: one <clip>_POST.txt beside each rendered clip ──
+        # Written after the render because each sheet is named for the finished file
+        # and quotes its rank, so it travels inside the downloaded ZIP.
+        verdict_by_idx = {v["index"]: v for v in council_verdicts}
+        clip_files = {}
+        if kits:
+            log.section("PUBLISH KIT FILES")
+            written = 0
+            for rc in raw_clips:
+                idx = rc["index"]
+                out, kit = results.get(idx), kits.get(idx)
+                if not out:
+                    continue
+                clip_files[idx] = os.path.basename(out)
+                if not kit:
+                    continue
+                # The posted length includes the cold open, so a hooked clip is
+                # longer than its source window — report what actually got rendered.
+                body = float(rc.get("end") or 0) - float(rc.get("start") or 0)
+                hooked = (hook_first and rc.get("hook_start") is not None
+                          and rc.get("hook_end") is not None)
+                extra = (float(rc["hook_end"]) - float(rc["hook_start"])) if hooked else 0.0
+                try:
+                    publish_kit.write_kit_file(
+                        kit, out,
+                        clip_meta={
+                            "filename": os.path.basename(out),
+                            "start": rc.get("start"),
+                            "end": rc.get("end"),
+                            "duration": body + extra,
+                            "hook_text": rc.get("hook_text", "") if hooked else "",
+                        },
+                        verdict=verdict_by_idx.get(idx),
+                    )
+                    written += 1
+                except OSError as e:
+                    log.error(f"Could not write posting sheet for clip {idx}: {e}")
+            log.log(f"   {written} posting sheet(s) written next to the clips.")
+
+        # One machine-readable file for the UI's ranking + copy panel.
+        if council_verdicts or kits:
+            try:
+                with open(os.path.join(job_dir, "publish_kit.json"), "w", encoding="utf-8") as f:
+                    json.dump({
+                        "ranking": council_verdicts,
+                        "kits": {str(k): v for k, v in kits.items()},
+                        "files": {str(k): v for k, v in clip_files.items()},
+                        "hooks": {str(rc["index"]): {
+                            "start": rc.get("hook_start"),
+                            "end": rc.get("hook_end"),
+                            "text": rc.get("hook_text", ""),
+                        } for rc in raw_clips if rc.get("hook_start") is not None},
+                    }, f, indent=2, ensure_ascii=False)
+            except OSError as e:
+                log.error(f"Could not write publish_kit.json: {e}")
 
     except Exception as e:
         log.section("SUBTITLE PIPELINE CRASHED")
